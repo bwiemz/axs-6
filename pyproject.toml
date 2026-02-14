@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "axs-format"
+version = "0.2.0"
+description = "AXS-6: Adaptive eXponent Sharing — a 6-bit training format more efficient than FP8"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+authors = [
+    {name = "AXS Research Team"},
+]
+keywords = ["deep-learning", "quantization", "low-precision", "training", "fp8", "normalfloat"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.1.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+triton = ["triton>=2.1.0"]
+benchmarks = ["matplotlib>=3.7.0", "pandas>=2.0.0", "tabulate>=0.9.0"]
+examples = ["torchvision>=0.16.0", "tqdm>=4.65.0"]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-benchmark>=4.0.0",
+    "ruff>=0.1.0",
+    "basedpyright>=1.1.0",
+]
+all = ["axs-format[triton,benchmarks,examples,dev]"]
+
+[tool.setuptools.packages.find]
+include = ["axs*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "TCH"]
+
+[tool.basedpyright]
+pythonVersion = "3.10"
+typeCheckingMode = "standard"
