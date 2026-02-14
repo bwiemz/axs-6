@@ -310,6 +310,7 @@ def convert_to_axs_unified(
                 in_f = child.in_features
                 out_f = child.out_features
                 has_bias = child.bias is not None
+                device = child.weight.device
                 new_layer = AXSLinearUnified(
                     in_f, out_f, bias=has_bias,
                     block_size=block_size,
@@ -319,18 +320,20 @@ def convert_to_axs_unified(
                 new_layer.weight.data.copy_(child.weight.data)
                 if has_bias and new_layer.bias is not None:
                     new_layer.bias.data.copy_(child.bias.data)
-                setattr(module, name, new_layer)
+                setattr(module, name, new_layer.to(device))
 
             elif isinstance(child, (nn.LayerNorm, AXSLayerNorm, AXSLayerNormV2)):
+                device = child.weight.device
                 new_layer = AXSLayerNormUnified(
                     list(child.normalized_shape),
                     eps=child.eps,
                 )
                 new_layer.weight.data.copy_(child.weight.data)
                 new_layer.bias.data.copy_(child.bias.data)
-                setattr(module, name, new_layer)
+                setattr(module, name, new_layer.to(device))
 
             elif isinstance(child, (nn.Embedding, AXSEmbedding, AXSEmbeddingV2)):
+                device = child.weight.device
                 new_layer = AXSEmbeddingUnified(
                     child.num_embeddings,
                     child.embedding_dim,
@@ -338,7 +341,7 @@ def convert_to_axs_unified(
                     block_size=block_size,
                 )
                 new_layer.weight.data.copy_(child.weight.data)
-                setattr(module, name, new_layer)
+                setattr(module, name, new_layer.to(device))
 
             else:
                 _convert(child, full_name)

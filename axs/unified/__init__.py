@@ -41,6 +41,15 @@ from axs.unified.training_unified import (
     AmaxEMA,
     AXSTrainingPipelineUnified,
 )
+from axs.unified.backend import (
+    BackendType,
+    accelerated_fake_quantize,
+    accelerated_linear,
+    backend_info,
+    detect_best_backend,
+    get_backend,
+    set_backend,
+)
 
 __all__ = [
     # Quantiser core
@@ -63,4 +72,12 @@ __all__ = [
     # Training
     "AXSTrainingPipelineUnified",
     "AmaxEMA",
+    # Backend / acceleration
+    "BackendType",
+    "accelerated_fake_quantize",
+    "accelerated_linear",
+    "backend_info",
+    "detect_best_backend",
+    "get_backend",
+    "set_backend",
 ]

@@ -24,6 +24,10 @@ import torch.nn.functional as F
 
 from axs.core import DEFAULT_BLOCK_SIZE
 from axs.unified.quantize_unified import fused_fake_quantize
+from axs.unified.backend import (
+    accelerated_fake_quantize as _accel_fq,
+    accelerated_linear as _accel_linear,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +49,7 @@ class _FusedQuantizeSTE(torch.autograd.Function):
         block_size: int,
         rounding: str,
     ) -> torch.Tensor:
-        return fused_fake_quantize(tensor, block_size=block_size, rounding=rounding)  # type: ignore[arg-type]
+        return _accel_fq(tensor, block_size=block_size, rounding=rounding)  # type: ignore[arg-type]
 
     @staticmethod
     def backward(  # type: ignore[override]
@@ -105,10 +109,10 @@ class _AXSLinearUnifiedFunction(torch.autograd.Function):
         quantize_input: bool,
         quantize_grad: bool,
     ) -> torch.Tensor:
-        weight_q = fused_fake_quantize(weight, block_size, "nearest")
+        weight_q = _accel_fq(weight, block_size, "nearest")
 
         if quantize_input:
-            input_q = fused_fake_quantize(input, block_size, "nearest")
+            input_q = _accel_fq(input, block_size, "nearest")
         else:
             input_q = input
 
@@ -133,7 +137,7 @@ class _AXSLinearUnifiedFunction(torch.autograd.Function):
         quantize_grad: bool = ctx.quantize_grad  # type: ignore[attr-defined]
 
         if quantize_grad:
-            grad_output = fused_fake_quantize(grad_output, block_size, "stochastic")
+            grad_output = _accel_fq(grad_output, block_size, "stochastic")
 
         grad_input = grad_output @ weight_q if ctx.needs_input_grad[0] else None  # type: ignore[index]
         grad_weight = (
@@ -201,8 +205,8 @@ def axs_matmul_unified(
         Result tensor ``(*, M, N)``.
     """
     if quantize_inputs:
-        a_q = fused_fake_quantize(a, block_size, "nearest")
-        b_q = fused_fake_quantize(b, block_size, "nearest")
+        a_q = _accel_fq(a, block_size, "nearest")
+        b_q = _accel_fq(b, block_size, "nearest")
     else:
         a_q, b_q = a, b
     return torch.matmul(a_q, b_q)
