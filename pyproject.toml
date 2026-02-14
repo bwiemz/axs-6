@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "axs-format"
-version = "0.2.0"
+version = "0.3.0"
 description = "AXS-6: Adaptive eXponent Sharing — a 6-bit training format more efficient than FP8"
 readme = "README.md"
 license = {text = "Apache-2.0"}

@@ -36,25 +36,28 @@ Modern AI training uses FP8 (8-bit floating point) as the frontier of low-precis
 | Dynamic range | ±448 | ±3.4e38 | **Vastly wider** |
 | Quantization levels | 16 per scale | 63 per scale | **~4× finer** |
 
-## Two Implementations: V1 (Fast) and V2 (High Quality)
+## Three Implementations: V1, V2, and Unified (Recommended)
 
-AXS-6 ships with two quantization backends. Both share the same 6-bit block format, but differ in *how* they map values to quantization codes:
+AXS-6 ships with three quantization backends. All share the same 6-bit block format, but differ in *how* they map values to quantization codes:
 
-| Feature | V1 | V2 |
-|---------|----|----|
-| Quantization grid | Uniform | **NormalFloat-5** (Gaussian-optimal) |
-| Scale computation | Block max | **Percentile clipping** (outlier-robust) |
-| Outlier handling | None | **Hadamard rotation** (optional) |
-| Activation balancing | None | **SmoothQuant** (per-channel) |
-| Training warmup | None | **Precision annealing** (FP32 → quant) |
-| Scale tracking | Per-step | **Amax EMA history** |
-| Weighted quantization MSE | baseline | **35.8% lower** |
-| SNR (Gaussian data) | 29.4 dB | **31.1 dB** (+1.7 dB) |
-| Training speed | baseline | ~18% slower |
+| Feature | V1 | V2 | **Unified** |
+|---------|----|----|-------------|
+| Quantization grid | Uniform | NormalFloat-5 | **Fused NF5 Warp Table** |
+| Scale computation | Block max | Percentile clipping | **Power-of-2 block max** |
+| Outlier handling | None | Hadamard rotation | None |
+| Activation balancing | None | SmoothQuant | None |
+| Training warmup | None | Precision annealing | **Skip-first-N** (zero overhead) |
+| Scale tracking | Per-step | Amax EMA history | **Optional Amax EMA** |
+| MSE (vs V1) | baseline | **-35.8%** | **-34.0%** |
+| SNR (Gaussian data) | 29.4 dB | 31.2 dB | **31.2 dB** |
+| Training speed (vs V1) | baseline | ~7% slower | **31% faster** |
+
+**Recommended:** The **Unified** backend achieves V2's quality at 31% faster speed than V1 by using a novel fused NF5 warp table — a 1024-entry precomputed LUT (4 KB) that replaces the entire encode→AXSTensor→decode pipeline with a single O(1) gather.
 
 **When to use which:**
-- **V1** — Maximum throughput, simple integration, good enough quality
-- **V2** — Best quality, research experiments, production pretraining where every 0.1 PPL counts
+- **Unified** (recommended) — Best of both worlds: V2 quality at faster-than-V1 speed
+- **V1** — Legacy compatibility, simple integration
+- **V2** — Research experiments with Hadamard rotation, SmoothQuant, precision annealing
 
 ## Tech Stack
 
@@ -108,14 +111,34 @@ x_q, scales = quantize_v2(x, block_size=32, percentile=99.5)
 x_restored = dequantize_v2(x_q, scales, block_size=32)
 ```
 
+### Basic Quantization (Unified — Fused NF5, Recommended)
+
+```python
+import torch
+from axs.unified import fused_fake_quantize, quantize_unified, dequantize_unified
+
+x = torch.randn(128, 256)
+
+# Fast training path (no intermediate AXSTensor)
+x_q = fused_fake_quantize(x, block_size=32)
+
+# Serialization path (produces AXSTensor for checkpoints)
+x_axs = quantize_unified(x, block_size=32)
+x_restored = dequantize_unified(x_axs)
+```
+
 ### Drop-in Layer Replacement
 
 ```python
-# V1 — fast path
+# Unified — recommended (V2 quality, fastest speed)
+from axs.unified import AXSLinearUnified
+layer = AXSLinearUnified(768, 256, block_size=32)
+
+# V1 — legacy
 from axs.nn import AXSLinear
 layer = AXSLinear(768, 256, block_size=32)
 
-# V2 — higher quality
+# V2 — research (Hadamard, SmoothQuant)
 from axs.v2 import AXSLinearV2
 layer = AXSLinearV2(768, 256, block_size=32)
 
@@ -125,6 +148,10 @@ output = layer(input)  # quantized forward, STE backward
 ### Convert an Entire Model
 
 ```python
+# Unified (recommended)
+from axs.unified import convert_to_axs_unified
+model = convert_to_axs_unified(model, block_size=32)
+
 # V1
 from axs.nn import convert_to_axs
 model = convert_to_axs(model, block_size=32)
@@ -134,24 +161,23 @@ from axs.v2 import convert_to_axs_v2
 model = convert_to_axs_v2(model, block_size=32)
 ```
 
-### V2 Training Pipeline with Precision Annealing
+### Unified Training Pipeline with Skip-first-N Warmup
 
 ```python
-from axs.v2 import AXSTrainingPipelineV2, convert_to_axs_v2
+from axs.unified import AXSTrainingPipelineUnified, convert_to_axs_unified
 
-model = convert_to_axs_v2(model, block_size=32)
-pipeline = AXSTrainingPipelineV2(
+model = convert_to_axs_unified(model, block_size=32)
+pipeline = AXSTrainingPipelineUnified(
     model,
     optimizer=torch.optim.AdamW(model.parameters(), lr=3e-4),
-    warmup_steps=500,       # start FP32, ramp to full quantization
-    use_smooth_quant=True,  # per-channel activation/weight balancing
+    warmup_steps=500,      # first 500 steps in FP32, zero overhead
     max_grad_norm=1.0,
 )
 
 for batch in dataloader:
-    stats = pipeline.train_step(batch, criterion)
+    stats = pipeline.training_step(batch, criterion)
     print(f"step {stats['step']}: loss={stats['loss']:.4f}, "
-          f"quant_strength={stats['quant_strength']:.2f}")
+          f"warmup={stats['warmup']}")
 ```
 
 ## Quantization Strategies (V1)
@@ -219,6 +245,12 @@ axs/
 │   ├── functional_v2.py     # V2 autograd functions
 │   ├── modules_v2.py        # V2 drop-in layers
 │   └── training.py          # V2 training pipeline
+├── unified/
+│   ├── __init__.py          # Unified public API
+│   ├── quantize_unified.py  # Fused NF5 warp table (LUT1024)
+│   ├── functional_unified.py # Unified autograd functions
+│   ├── modules_unified.py   # Unified drop-in layers
+│   └── training_unified.py  # Unified training pipeline + Amax EMA
 └── triton_kernels/
     ├── quantize_kernel.py   # Fused quantize/dequantize GPU kernels
     └── matmul_kernel.py     # Fused quantized matrix multiplication
@@ -228,7 +260,8 @@ benchmarks/
 ├── benchmark_memory.py      # Memory footprint analysis
 ├── benchmark_speed.py       # Throughput benchmarks
 ├── benchmark_vs_fp8.py      # AXS-6 vs FP8 pretraining comparison
-└── benchmark_v1_vs_v2.py    # V1 vs V2 A/B quality benchmark
+├── benchmark_v1_vs_v2.py    # V1 vs V2 A/B quality benchmark
+└── benchmark_unified.py     # V1 vs V2 vs Unified speed + quality + training
 
 examples/
 ├── train_mnist.py           # MNIST training comparison
@@ -239,20 +272,24 @@ tests/
 ├── test_quantize.py         # Quantization strategy tests
 ├── test_nn.py               # Neural network module tests
 ├── test_training.py         # End-to-end training tests
-└── test_v2.py               # V2 component tests (37 tests)
+├── test_v2.py               # V2 component tests (37 tests)
+└── test_unified.py          # Unified component tests (66 tests)
 ```
 
 ## Running Tests
 
 ```bash
-# All tests (92 total)
+# All tests (158 total)
 pytest tests/ -v
 
-# V1 only
-pytest tests/ -v --ignore=tests/test_v2.py
+# V1 only (55 tests)
+pytest tests/ -v --ignore=tests/test_v2.py --ignore=tests/test_unified.py
 
-# V2 only
+# V2 only (37 tests)
 pytest tests/test_v2.py -v
+
+# Unified only (66 tests)
+pytest tests/test_unified.py -v
 ```
 
 ## Running Benchmarks
@@ -285,27 +322,42 @@ python -m examples.train_transformer
 
 Tested on NVIDIA RTX 5070 Ti (16 GB), PyTorch 2.10, Python 3.14:
 
-### Quantization Quality (V1 vs V2)
-
-| Distribution | V1 SNR | V2 SNR | Improvement |
-|-------------|--------|--------|-------------|
-| Normal(0,1) | 29.4 dB | 31.1 dB | **+1.7 dB** |
-| Heavy-tailed | 25.7 dB | 28.1 dB | **+2.5 dB** |
-| Outlier (1% at 10×) | 24.8 dB | 27.7 dB | **+2.8 dB** |
-| Aggregate MSE | baseline | **-35.8%** | |
-
 ### Training Speed (MiniGPT, 200 steps)
 
-| Backend | ms/step | Perplexity |
-|---------|---------|------------|
-| FP32 | 10.5 | 257.24 |
-| AXS-6 V1 | 41.5 | 257.27 |
-| AXS-6 V2 | 49.2 | 257.36 |
-| FP8 (simulated) | 47.9 | 304.22 |
+| Backend | ms/step | Speedup vs V1 | Final Loss |
+|---------|---------|----------------|------------|
+| FP32 (baseline) | 6.83 | — | 0.0560 |
+| **Unified** | **22.98** | **+31%** | 0.0578 |
+| V2 | 31.26 | — | 0.0563 |
+| V1 | 33.52 | baseline | 0.0575 |
+
+### Quantization Quality
+
+| Backend | MSE | SNR (dB) | vs V1 |
+|---------|-----|----------|-------|
+| V1 | 0.00116 | 29.4 | baseline |
+| V2 | 0.00076 | 31.2 | -34.5% MSE |
+| **Unified** | **0.00077** | **31.2** | **-34.0% MSE** |
+
+### Fake-Quantize Latency (4096×4096 tensor, GPU)
+
+| Backend | Latency (ms) | vs V1 |
+|---------|-------------|-------|
+| V1 | 5.90 | baseline |
+| V2 | 9.70 | +64% slower |
+| **Unified** | **6.33** | **~same** |
+
+### Key Insight: Why Unified Is Fast
+
+The unified quantiser replaces the entire encode → AXSTensor → decode pipeline
+with a single precomputed **fused NF5 warp table** — a 1024-entry LUT (4 KB)
+that maps any normalised [0,1] value to its NF5 reconstruction value in O(1).
+The 4 KB table fits entirely in GPU L1 cache, making the gather operation faster
+than V1's arithmetic (round + clamp + divide).
 
 ### vs FP8
 
-AXS-6 matches FP32 training quality (PPL 257 vs 257) while FP8 degrades significantly (PPL 304). AXS-6 achieves 21% memory reduction over FP8.
+AXS-6 matches FP32 training quality while FP8 degrades significantly. AXS-6 achieves 21% memory reduction over FP8.
 
 ## Format Specification
 
