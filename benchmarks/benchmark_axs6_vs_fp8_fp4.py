@@ -19,9 +19,14 @@ Run:  python -m benchmarks.benchmark_axs6_vs_fp8_fp4
 from __future__ import annotations
 
 import math
+import os
 import sys
 import time
 from pathlib import Path
+
+# Avoid Windows long-path issues with Triton cache
+if sys.platform == "win32" and "TORCHINDUCTOR_CACHE_DIR" not in os.environ:
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = r"C:\tmp\ti"
 
 import torch
 import torch.nn as nn
@@ -357,19 +362,27 @@ def run_training(
 # ═══════════════════════════════════════════════════════════════════════════
 
 def bench_fake_quantize(device: str = "cuda") -> dict[str, float]:
-    """Measure raw fake-quantize latency on a 4096×4096 tensor."""
+    """Measure raw fake-quantize latency on a 4096x4096 tensor."""
     print("\n" + "=" * 72)
-    print("FAKE-QUANTIZE LATENCY  (4096×4096 tensor)")
+    print("FAKE-QUANTIZE LATENCY  (4096x4096 tensor)")
     print("=" * 72)
 
     from axs.unified.quantize_unified import fused_fake_quantize
+    from axs.unified.backend import accelerated_fake_quantize, set_backend
+
+    # Build compiled FQ wrapper
+    set_backend("compiled")
+    def _compiled_fq(t: torch.Tensor) -> torch.Tensor:
+        return accelerated_fake_quantize(t, 32, "nearest")
+    set_backend("eager")  # reset
 
     x = torch.randn(4096, 4096, device=device)
     fns: dict[str, callable] = {
         "FP8 E4M3": fp8_e4m3_fake_quantize,
         "FP4 E2M1": fp4_e2m1_fake_quantize,
         "NF4":      nf4_fake_quantize,
-        "AXS-6":    fused_fake_quantize,
+        "AXS-6 (eager)": fused_fake_quantize,
+        "AXS-6 (compiled)": _compiled_fq,
     }
 
     results: dict[str, float] = {}
@@ -388,10 +401,10 @@ def bench_fake_quantize(device: str = "cuda") -> dict[str, float]:
         ms = (time.perf_counter() - t0) / 30 * 1000
         results[name] = ms
 
-    print(f"\n  {'Format':<12} {'Latency':>10}")
-    print(f"  {'─' * 12} {'─' * 10}")
+    print(f"\n  {'Format':<22} {'Latency':>10}")
+    print(f"  {'---' * 8} {'---' * 4}")
     for name, ms in results.items():
-        print(f"  {name:<12} {ms:>8.3f} ms")
+        print(f"  {name:<22} {ms:>8.3f} ms")
 
     return results
 
@@ -420,7 +433,7 @@ def bench_quality(device: str = "cpu") -> None:
     }
 
     print(f"\n  {'Format':<12} {'Bits':>6} {'MSE':>14} {'SNR (dB)':>10} {'Max Err':>10}")
-    print(f"  {'─' * 12} {'─' * 6} {'─' * 14} {'─' * 10} {'─' * 10}")
+    print(f"  {'---' * 4} {'---' * 2} {'---' * 5} {'---' * 4} {'---' * 4}")
 
     bits_map = {"FP8 E4M3": "8.00", "FP4 E2M1": "4.00", "NF4": "4.00", "AXS-6": "6.31"}
 
@@ -472,13 +485,23 @@ def main() -> None:
     print("=" * 72)
 
     from axs.unified.modules_unified import convert_to_axs_unified
+    from axs.unified.backend import set_backend
+
+    def _convert_axs_eager(m: nn.Module) -> nn.Module:
+        set_backend("eager")
+        return convert_to_axs_unified(m)
+
+    def _convert_axs_compiled(m: nn.Module) -> nn.Module:
+        set_backend("compiled")
+        return convert_to_axs_unified(m)
 
     configs: list[tuple[str, str, callable]] = [
-        ("FP32",     "32.00", lambda m: m),
-        ("FP8 E4M3", "8.00",  convert_to_fp8),
-        ("FP4 E2M1", "4.00",  convert_to_fp4),
-        ("NF4",      "4.00",  convert_to_nf4),
-        ("AXS-6",    "6.31",  lambda m: convert_to_axs_unified(m)),
+        ("FP32",           "32.00", lambda m: m),
+        ("FP8 E4M3",      "8.00",  convert_to_fp8),
+        ("FP4 E2M1",      "4.00",  convert_to_fp4),
+        ("NF4",           "4.00",  convert_to_nf4),
+        ("AXS-6 eager",   "6.31",  _convert_axs_eager),
+        ("AXS-6 compiled","6.31",  _convert_axs_compiled),
     ]
 
     results: dict[str, dict] = {}
@@ -500,32 +523,32 @@ def main() -> None:
 
     fp32_ms = results["FP32"]["avg_ms"]
 
-    header = (f"  {'Format':<12} {'Bits':>6} {'ms/step':>10} {'vs FP32':>8} "
+    header = (f"  {'Format':<18} {'Bits':>6} {'ms/step':>10} {'vs FP32':>8} "
               f"{'tok/s':>10} {'Loss':>8} {'PPL':>8}")
     print(f"\n{header}")
-    print(f"  {'─' * 12} {'─' * 6} {'─' * 10} {'─' * 8} {'─' * 10} {'─' * 8} {'─' * 8}")
+    print(f"  {'---' * 6} {'---' * 2} {'---' * 4} {'---' * 3} {'---' * 4} {'---' * 3} {'---' * 3}")
 
     bits_map = {"FP32": "32.00", "FP8 E4M3": "8.00", "FP4 E2M1": "4.00",
-                "NF4": "4.00", "AXS-6": "6.31"}
+                "NF4": "4.00", "AXS-6 eager": "6.31", "AXS-6 compiled": "6.31"}
 
-    for name in ["FP32", "FP8 E4M3", "FP4 E2M1", "NF4", "AXS-6"]:
+    for name in ["FP32", "FP8 E4M3", "FP4 E2M1", "NF4", "AXS-6 eager", "AXS-6 compiled"]:
         r = results[name]
         ratio = f"{r['avg_ms'] / fp32_ms:.2f}x"
-        print(f"  {name:<12} {bits_map[name]:>6} {r['avg_ms']:>10.2f} {ratio:>8} "
+        print(f"  {name:<18} {bits_map[name]:>6} {r['avg_ms']:>10.2f} {ratio:>8} "
               f"{r['tok_per_sec']:>10,.0f} {r['final_loss']:>8.4f} {r['final_ppl']:>8.2f}")
 
-    # ── Pairwise comparisons ──
-    print(f"\n  Pairwise Speed (ms/step):")
-    axs = results["AXS-6"]["avg_ms"]
-    for other in ["FP8 E4M3", "FP4 E2M1", "NF4"]:
+    # ── Pairwise comparisons (compiled AXS-6 vs others) ──
+    print(f"\n  Pairwise Speed (ms/step) -- AXS-6 compiled vs others:")
+    axs = results["AXS-6 compiled"]["avg_ms"]
+    for other in ["FP32", "FP8 E4M3", "FP4 E2M1", "NF4", "AXS-6 eager"]:
         other_ms = results[other]["avg_ms"]
         diff = axs - other_ms
         pct = (diff / other_ms) * 100
         faster = "faster" if diff < 0 else "slower"
-        print(f"    AXS-6 vs {other:<10}: {abs(diff):.2f} ms {faster} ({abs(pct):.1f}%)")
+        print(f"    AXS-6 compiled vs {other:<18}: {abs(diff):.2f} ms {faster} ({abs(pct):.1f}%)")
 
     print(f"\n  Pairwise Quality (final loss):")
-    axs_loss = results["AXS-6"]["final_loss"]
+    axs_loss = results["AXS-6 compiled"]["final_loss"]
     for other in ["FP32", "FP8 E4M3", "FP4 E2M1", "NF4"]:
         other_loss = results[other]["final_loss"]
         diff = axs_loss - other_loss
@@ -544,19 +567,19 @@ def main() -> None:
     print("CAVEATS")
     print("=" * 72)
     print("""
-  1. All formats use SOFTWARE fake-quantize (STE). No hardware-native
-     quantised matmuls are used. This measures quantisation overhead only.
+  1. FP8/FP4/NF4 use SOFTWARE fake-quantize (STE). AXS-6 compiled uses
+     torch.compile to fuse quantization ops into Triton kernels.
 
   2. FP8 has NATIVE HARDWARE support on H100/H200/B100/B200 GPUs, which
-     would make FP8 matmuls ~2× faster than FP16. AXS-6 and FP4 do not
-     have native hardware support yet.
+     would make FP8 matmuls ~2x faster than FP16. AXS-6 uses
+     torch.compile for acceleration.
 
   3. The FP4 simulations (E2M1 and NF4) use per-block nearest-value
      lookups, which are representative of QLoRA / MXFP4 behaviour.
 
   4. AXS-6's advantage is in MEMORY-BANDWIDTH-BOUND scenarios:
      - 21% less communication than FP8 in distributed training
-     - 4× finer quantisation than FP8 (5-bit mantissa vs 3-bit)
+     - 4x finer quantisation than FP8 (5-bit mantissa vs 3-bit)
      - Better convergence quality than both FP8 and FP4
 """)
 

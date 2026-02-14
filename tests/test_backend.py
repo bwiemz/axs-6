@@ -111,17 +111,20 @@ class TestDetection:
         assert isinstance(result, BackendType)
 
     def test_detect_compiled_when_cuda_and_compile(self):
-        with mock.patch("axs.unified.backend._has_cuda", return_value=True), \
+        with mock.patch("axs.unified.backend._has_triton_kernel", return_value=False), \
+             mock.patch("axs.unified.backend._has_cuda", return_value=True), \
              mock.patch("axs.unified.backend._has_torch_compile", return_value=True):
             assert detect_best_backend() == BackendType.COMPILED
 
     def test_detect_eager_when_no_compile(self):
-        with mock.patch("axs.unified.backend._has_cuda", return_value=True), \
+        with mock.patch("axs.unified.backend._has_triton_kernel", return_value=False), \
+             mock.patch("axs.unified.backend._has_cuda", return_value=True), \
              mock.patch("axs.unified.backend._has_torch_compile", return_value=False):
             assert detect_best_backend() == BackendType.EAGER
 
     def test_detect_eager_when_no_cuda(self):
-        with mock.patch("axs.unified.backend._has_cuda", return_value=False):
+        with mock.patch("axs.unified.backend._has_triton_kernel", return_value=False), \
+             mock.patch("axs.unified.backend._has_cuda", return_value=False):
             assert detect_best_backend() == BackendType.EAGER
 
     def test_env_override_eager(self):
@@ -414,7 +417,7 @@ class TestBackendInfo:
 
     def test_active_backend_is_string(self):
         info = backend_info()
-        assert info["active_backend"] in ("eager", "compiled", "int8")
+        assert info["active_backend"] in ("eager", "compiled", "int8", "triton")
 
     def test_booleans(self):
         info = backend_info()

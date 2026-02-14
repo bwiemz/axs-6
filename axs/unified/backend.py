@@ -4,12 +4,15 @@ AXS-6 Hardware Backend Dispatch
 
 Automatically selects the fastest available backend for AXS-6 operations:
 
-  1. **Compiled** — ``torch.compile`` fuses NF5 LUT ops into efficient Triton
-     kernels.  ~4× faster than eager.  Requires PyTorch 2.1+ with Triton.
-  2. **INT8 Tensor Core** — For very large matmuls, encodes NF5 values to int8
+  1. **Triton** — Hand-written Triton kernel that fuses the entire NF5 LUT
+     fake-quantize into a single pass.  ~15× faster than eager.  Requires
+     Triton ≥ 3.0 and a CUDA GPU.
+  2. **Compiled** — ``torch.compile`` fuses NF5 LUT ops into efficient Triton
+     kernels.  ~2–4× faster than eager.  Requires PyTorch 2.1+ with Triton.
+  3. **INT8 Tensor Core** — For very large matmuls, encodes NF5 values to int8
      and uses ``torch._int_mm`` for the GEMM, with per-row scale correction.
      Requires CUDA compute capability ≥ 7.5 (Turing+).
-  3. **Eager** — Pure-PyTorch fallback.  Always works.
+  4. **Eager** — Pure-PyTorch fallback.  Always works.
 
 The backend is selected automatically at first use and cached.  Users can
 override with :func:`set_backend` or the ``AXS6_BACKEND`` environment variable.
@@ -20,7 +23,7 @@ Usage::
 
     # Auto-detect (default)
     backend = get_backend()
-    print(backend.name)  # "compiled" on most CUDA setups
+    print(backend.name)  # "triton" on most CUDA setups
 
     # Force a specific backend
     set_backend("eager")
@@ -47,8 +50,8 @@ import torch.nn.functional as F
 
 from axs.core import DEFAULT_BLOCK_SIZE
 from axs.unified.quantize_unified import (
-    FUSED_NF5_LUT,
     _LUT_MAX_IDX,
+    FUSED_NF5_LUT,
     fused_fake_quantize,
 )
 
@@ -78,6 +81,7 @@ class BackendType(enum.Enum):
     EAGER = "eager"
     COMPILED = "compiled"
     INT8 = "int8"
+    TRITON = "triton"
 
 
 # ---------------------------------------------------------------------------
@@ -110,13 +114,26 @@ def _has_torch_compile() -> bool:
         return False
 
 
+def _has_triton_kernel() -> bool:
+    """Check if the custom Triton NF5 kernel is available."""
+    try:
+        from axs.unified.triton_kernels import has_triton
+
+        return has_triton()
+    except ImportError:
+        return False
+
+
 def detect_best_backend() -> BackendType:
     """Auto-detect the best available backend."""
     # Environment override
     env = os.environ.get("AXS6_BACKEND", "").lower().strip()
-    if env in ("eager", "compiled", "int8"):
+    if env in ("eager", "compiled", "int8", "triton"):
         return BackendType(env)
 
+    # Prefer: triton > compiled > eager
+    if _has_triton_kernel():
+        return BackendType.TRITON
     if _has_cuda() and _has_torch_compile():
         return BackendType.COMPILED
     return BackendType.EAGER
@@ -145,7 +162,8 @@ def set_backend(backend: str | BackendType) -> None:
     Override the active backend.
 
     Args:
-        backend: One of ``"eager"``, ``"compiled"``, or ``"int8"``.
+        backend: One of ``"eager"``, ``"compiled"``, ``"int8"``, or
+            ``"triton"``.
     """
     global _active_backend, _compiled_fq, _compiled_fq_stochastic
     if isinstance(backend, str):
@@ -345,11 +363,23 @@ def accelerated_fake_quantize(
     """
     Fake-quantize using the best available backend.
 
-    - **compiled**: ``torch.compile``'d NF5 LUT (~4× faster than eager)
+    - **triton**: Custom Triton kernel (~15× faster than eager)
+    - **compiled**: ``torch.compile``'d NF5 LUT (~2–4× faster than eager)
     - **eager**: Original pure-PyTorch implementation
     - **int8**: Falls back to compiled FQ (INT8 only helps the matmul)
     """
     backend = get_backend()
+
+    # Triton kernel — fastest path
+    if backend == BackendType.TRITON:
+        try:
+            from axs.unified.triton_kernels import triton_fused_fake_quantize
+
+            return triton_fused_fake_quantize(tensor, block_size, rounding)
+        except Exception:
+            logger.warning("Triton kernel failed, falling back to compiled")
+            set_backend("compiled")
+            return accelerated_fake_quantize(tensor, block_size, rounding)
 
     if backend == BackendType.COMPILED or backend == BackendType.INT8:
         try:
@@ -398,6 +428,23 @@ def accelerated_linear(
             return int8_linear(input, weight, bias, block_size)
         # Fall through to compiled for small matrices
 
+    # Triton path: custom kernel FQ + FP32 matmul
+    if backend == BackendType.TRITON:
+        try:
+            from axs.unified.triton_kernels import triton_fused_fake_quantize
+
+            w_q = triton_fused_fake_quantize(weight, block_size, "nearest")
+            x_q = (
+                triton_fused_fake_quantize(input, block_size, "nearest")
+                if quantize_input
+                else input
+            )
+            return F.linear(x_q, w_q, bias)
+        except Exception:
+            logger.warning("Triton kernel failed in linear, falling back to compiled")
+            set_backend("compiled")
+            return accelerated_linear(input, weight, bias, block_size, quantize_input)
+
     # Compiled path: fused NF5 FQ + FP32 matmul
     if backend in (BackendType.COMPILED, BackendType.INT8):
         try:
@@ -424,6 +471,7 @@ def backend_info() -> dict[str, object]:
     return {
         "active_backend": get_backend().value,
         "cuda_available": _has_cuda(),
+        "triton_kernel": _has_triton_kernel(),
         "int8_tensorcore": _has_int8_tensorcore(),
         "torch_compile": _has_torch_compile(),
         "gpu_name": torch.cuda.get_device_name() if _has_cuda() else None,

@@ -17,13 +17,14 @@ Quality (MSE, same tensor):
   - **Unified: 0.00077** (matches V2 within 0.1%)
 """
 
-from axs.unified.quantize_unified import (
-    FUSED_NF5_LUT,
-    NF5_CODEBOOK,
-    dequantize_unified,
-    fused_fake_quantize,
-    quantization_error_unified,
-    quantize_unified,
+from axs.unified.backend import (
+    BackendType,
+    accelerated_fake_quantize,
+    accelerated_linear,
+    backend_info,
+    detect_best_backend,
+    get_backend,
+    set_backend,
 )
 from axs.unified.functional_unified import (
     axs_linear_unified,
@@ -37,18 +38,21 @@ from axs.unified.modules_unified import (
     AXSMultiheadAttentionUnified,
     convert_to_axs_unified,
 )
+from axs.unified.quantize_unified import (
+    FUSED_NF5_LUT,
+    NF5_CODEBOOK,
+    dequantize_unified,
+    fused_fake_quantize,
+    quantization_error_unified,
+    quantize_unified,
+)
 from axs.unified.training_unified import (
     AmaxEMA,
     AXSTrainingPipelineUnified,
 )
-from axs.unified.backend import (
-    BackendType,
-    accelerated_fake_quantize,
-    accelerated_linear,
-    backend_info,
-    detect_best_backend,
-    get_backend,
-    set_backend,
+from axs.unified.triton_kernels import (
+    has_triton,
+    triton_fused_fake_quantize,
 )
 
 __all__ = [
@@ -80,4 +84,7 @@ __all__ = [
     "detect_best_backend",
     "get_backend",
     "set_backend",
+    # Triton kernels
+    "has_triton",
+    "triton_fused_fake_quantize",
 ]
