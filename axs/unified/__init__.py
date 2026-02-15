@@ -64,6 +64,18 @@ from axs.unified.triton_kernels import (
     triton_fused_linear,
 )
 
+# Distributed support (lazy import — torch.distributed may not be available)
+try:
+    from axs.unified.distributed import (
+        AXS6GradCompressor,
+        axs6_gradient_hook,
+        axs6_gradient_hook_packed,
+    )
+
+    _HAS_DISTRIBUTED = True
+except ImportError:
+    _HAS_DISTRIBUTED = False
+
 __all__ = [
     # Quantiser core
     "fused_fake_quantize",
@@ -104,4 +116,10 @@ __all__ = [
     "axs_linear_mixed_precision",
     "convert_to_axs_mixed_precision",
     "estimate_memory_savings",
+    # Distributed (conditional)
+    *((
+        "AXS6GradCompressor",
+        "axs6_gradient_hook",
+        "axs6_gradient_hook_packed",
+    ) if _HAS_DISTRIBUTED else ()),
 ]

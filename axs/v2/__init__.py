@@ -1,6 +1,19 @@
 """
-AXS-6 v2: Advanced Quantization Techniques
-===========================================
+AXS-6 v2: Advanced Quantization Techniques (Legacy)
+=====================================================
+
+.. deprecated:: 0.3.0
+    Use :mod:`axs.unified` instead.  The unified API incorporates all V2
+    innovations (NF5 codebook, amax EMA, stochastic dithering) with
+    superior performance via the fused NF5 warp table + Triton kernels.
+
+    Migration::
+
+        # Old (V2)
+        from axs.v2 import AXSLinearV2, convert_to_axs_v2
+
+        # New (unified)
+        from axs.unified import AXSLinearUnified, convert_to_axs_unified
 
 This module contains the next-generation optimizations that make AXS-6
 a compelling alternative to FP8/BF16 for real-world pretraining.
@@ -14,6 +27,16 @@ Key improvements over v1:
   6. Amax history — delayed scaling with exponential moving average
   7. Per-layer adaptive block sizing
 """
+
+import warnings as _warnings
+
+_warnings.warn(
+    "axs.v2 is deprecated since v0.3.0. Use axs.unified instead. "
+    "The unified API includes all V2 innovations (NF5, amax EMA, "
+    "stochastic dithering) with fused LUT + Triton kernel performance.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 from axs.v2.quantize_v2 import quantize_v2, dequantize_v2
 from axs.v2.hadamard import apply_hadamard_rotation, invert_hadamard_rotation

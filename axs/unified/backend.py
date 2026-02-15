@@ -131,9 +131,13 @@ def detect_best_backend() -> BackendType:
     if env in ("eager", "compiled", "int8", "triton"):
         return BackendType(env)
 
-    # Prefer: triton > compiled > eager
+    # Prefer: triton > int8 (if tensor cores) > compiled > eager
     if _has_triton_kernel():
         return BackendType.TRITON
+    if _has_int8_tensorcore() and _has_torch_compile():
+        # INT8 path uses tensor cores for large matmuls and falls through
+        # to compiled FQ for the quantise step, so it needs compile too.
+        return BackendType.INT8
     if _has_cuda() and _has_torch_compile():
         return BackendType.COMPILED
     return BackendType.EAGER
@@ -251,8 +255,9 @@ def _get_compiled_fq(stochastic: bool = False) -> callable:
 # INT8 tensor core backend
 # ---------------------------------------------------------------------------
 
-# Cache for padded weight encodings to avoid re-encoding every call
-_INT8_WEIGHT_CACHE: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+# Cache for padded weight encodings to avoid re-encoding every call.
+# Keys: (data_ptr, out_features, in_features) for safe cache invalidation.
+_INT8_WEIGHT_CACHE: dict[tuple[int, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def _nf5_to_int8_row(
@@ -349,19 +354,28 @@ def int8_linear(
     # Encode input to int8
     x_i8, x_s = _nf5_to_int8_row(x_2d, block_size, lut)
 
-    # Cache weight encoding (weights don't change within a step)
-    w_key = weight.data_ptr()
+    # Cache weight encoding (weights don't change within a step).
+    # Key includes shape to avoid false hits from pointer reuse.
+    w_key = (weight.data_ptr(), weight.shape[0], weight.shape[1])
     cached = _INT8_WEIGHT_CACHE.get(w_key)
-    if cached is not None and cached[0].shape == (weight.shape[0], weight.shape[1]):
+    if cached is not None:
         w_i8, w_s = cached
     else:
         w_i8, w_s = _nf5_to_int8_row(weight, block_size, lut)
         _INT8_WEIGHT_CACHE[w_key] = (w_i8, w_s)
 
-    # Pad M to multiple of 32 (torch._int_mm requirement on some GPUs)
+    # Pad M to multiple of 32 (torch._int_mm alignment requirement)
     M_pad = (32 - M % 32) % 32
     if M_pad > 0:
         x_i8 = F.pad(x_i8, (0, 0, 0, M_pad))
+
+    # Pad K to match if needed (weight may have different encoded width)
+    if x_i8.shape[1] != w_i8.shape[1]:
+        target_k = max(x_i8.shape[1], w_i8.shape[1])
+        if x_i8.shape[1] < target_k:
+            x_i8 = F.pad(x_i8, (0, target_k - x_i8.shape[1]))
+        if w_i8.shape[1] < target_k:
+            w_i8 = F.pad(w_i8, (0, target_k - w_i8.shape[1]))
 
     # INT8 tensor core matmul
     result_int = torch._int_mm(x_i8, w_i8.t())  # [M_padded, out_f] int32

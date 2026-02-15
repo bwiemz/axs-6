@@ -111,10 +111,20 @@ class TestDetection:
         assert isinstance(result, BackendType)
 
     def test_detect_compiled_when_cuda_and_compile(self):
+        """When CUDA + compile but no Triton and no INT8 tensor cores → COMPILED."""
         with mock.patch("axs.unified.backend._has_triton_kernel", return_value=False), \
              mock.patch("axs.unified.backend._has_cuda", return_value=True), \
+             mock.patch("axs.unified.backend._has_int8_tensorcore", return_value=False), \
              mock.patch("axs.unified.backend._has_torch_compile", return_value=True):
             assert detect_best_backend() == BackendType.COMPILED
+
+    def test_detect_int8_when_tensorcore_available(self):
+        """When CUDA + compile + INT8 tensor cores but no Triton → INT8."""
+        with mock.patch("axs.unified.backend._has_triton_kernel", return_value=False), \
+             mock.patch("axs.unified.backend._has_cuda", return_value=True), \
+             mock.patch("axs.unified.backend._has_int8_tensorcore", return_value=True), \
+             mock.patch("axs.unified.backend._has_torch_compile", return_value=True):
+            assert detect_best_backend() == BackendType.INT8
 
     def test_detect_eager_when_no_compile(self):
         with mock.patch("axs.unified.backend._has_triton_kernel", return_value=False), \

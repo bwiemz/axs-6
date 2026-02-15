@@ -623,6 +623,19 @@ def main() -> None:
         ("AXS-6 compiled","6.31",  _convert_axs_compiled),
     ]
 
+    # Optional: torchao hardware-accelerated FP8 (requires torchao + FP8-capable GPU)
+    try:
+        from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+        def _convert_torchao_fp8(m: nn.Module) -> nn.Module:
+            cfg = Float8LinearConfig()
+            convert_to_float8_training(m, config=cfg)
+            return m
+        configs.append(("torchao FP8 (hw)", "8.00", _convert_torchao_fp8))
+        print("  [+] torchao detected — including hardware FP8 baseline")
+    except ImportError:
+        print("  [!] torchao not installed — skipping hardware FP8 baseline")
+        print("      Install: pip install torchao  (requires FP8-capable GPU)")
+
     results: dict[str, dict] = {}
     for name, bits, convert_fn in configs:
         print(f"\n  Training {name} ({bits} bits) ...")
@@ -649,18 +662,22 @@ def main() -> None:
 
     bits_map = {"FP32": "32.00", "FP8 naive": "8.00", "FP8 proper": "8.00",
                 "FP4 E2M1": "4.00",
-                "NF4": "4.00", "AXS-6 eager": "6.31", "AXS-6 compiled": "6.31"}
+                "NF4": "4.00", "AXS-6 eager": "6.31", "AXS-6 compiled": "6.31",
+                "torchao FP8 (hw)": "8.00"}
 
-    for name in ["FP32", "FP8 naive", "FP8 proper", "FP4 E2M1", "NF4", "AXS-6 eager", "AXS-6 compiled"]:
+    for name in results:
         r = results[name]
+        bits = bits_map.get(name, "?")
         ratio = f"{r['avg_ms'] / fp32_ms:.2f}x"
-        print(f"  {name:<18} {bits_map[name]:>6} {r['avg_ms']:>10.2f} {ratio:>8} "
+        print(f"  {name:<18} {bits:>6} {r['avg_ms']:>10.2f} {ratio:>8} "
               f"{r['tok_per_sec']:>10,.0f} {r['final_loss']:>8.4f} {r['final_ppl']:>8.2f}")
 
     # ── Pairwise comparisons (compiled AXS-6 vs others) ──
     print(f"\n  Pairwise Speed (ms/step) -- AXS-6 compiled vs others:")
     axs = results["AXS-6 compiled"]["avg_ms"]
-    for other in ["FP32", "FP8 naive", "FP8 proper", "FP4 E2M1", "NF4", "AXS-6 eager"]:
+    for other in results:
+        if other == "AXS-6 compiled":
+            continue
         other_ms = results[other]["avg_ms"]
         diff = axs - other_ms
         pct = (diff / other_ms) * 100
@@ -669,10 +686,12 @@ def main() -> None:
 
     print(f"\n  Pairwise Quality (final loss):")
     axs_loss = results["AXS-6 compiled"]["final_loss"]
-    for other in ["FP32", "FP8 naive", "FP8 proper", "FP4 E2M1", "NF4"]:
+    for other in results:
+        if "AXS-6" in other:
+            continue
         other_loss = results[other]["final_loss"]
         diff = axs_loss - other_loss
-        print(f"    AXS-6 vs {other:<12}: {diff:+.4f} loss")
+        print(f"    AXS-6 vs {other:<18}: {diff:+.4f} loss")
 
     # ── Memory comparison ──
     print(f"\n  Memory Efficiency (bits per value):")
