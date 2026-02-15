@@ -15,17 +15,45 @@ with production-grade training utilities:
      *before* quantisation to prevent overflow).
   4. **Adaptive loss scaling** with overflow detection and backoff/growth.
   5. **Step-level metrics** for debugging and monitoring.
+  6. **Checkpoint save/load**: Full training state (model, optimiser,
+     scheduler, step counter, loss scale, RNG) for crash recovery.
+  7. **LR scheduler integration**: Optional scheduler stepped per-batch
+     or per-epoch.
 """
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
 from typing import Any, Callable
 
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LRScheduler
 
 from axs.unified.modules_unified import AXSLinearUnified, AXSEmbeddingUnified
+
+logger = logging.getLogger(__name__)
+
+# Lazy import to avoid circular dependency — resolved at runtime
+_MIXED_PRECISION_TYPES: tuple[type, ...] | None = None
+
+
+def _get_warmup_types() -> tuple[type, ...]:
+    """Return all module types that have a ``_warmup_active`` flag."""
+    global _MIXED_PRECISION_TYPES
+    if _MIXED_PRECISION_TYPES is None:
+        try:
+            from axs.unified.mixed_precision import AXSLinearMixedPrecision
+            _MIXED_PRECISION_TYPES = (
+                AXSLinearUnified,
+                AXSEmbeddingUnified,
+                AXSLinearMixedPrecision,
+            )
+        except ImportError:
+            _MIXED_PRECISION_TYPES = (AXSLinearUnified, AXSEmbeddingUnified)
+    return _MIXED_PRECISION_TYPES
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +100,13 @@ class AmaxEMA:
         raw_exp = math.floor(math.log2(amax)) + 1
         return 2.0 ** raw_exp
 
+    def state_dict(self) -> dict[str, Any]:
+        return {"decay": self.decay, "values": dict(self._values)}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self.decay = state["decay"]
+        self._values = dict(state["values"])
+
 
 # ---------------------------------------------------------------------------
 # Unified Training Pipeline
@@ -87,10 +122,13 @@ class AXSTrainingPipelineUnified:
       - Pre-quantisation gradient clipping
       - Adaptive loss scaling with overflow detection
       - Step-level training metrics
+      - Checkpoint save/load for crash recovery
+      - LR scheduler integration
 
     Args:
-        model: Model with unified AXS-6 layers.
+        model: Model with unified AXS-6 layers (or BF16 mixed-precision).
         optimizer: PyTorch optimiser.
+        scheduler: Optional LR scheduler (stepped every training step).
         warmup_steps: Number of initial steps where quantisation is skipped.
         loss_scale_init: Initial loss scale for mixed-precision stability.
         loss_scale_growth_interval: Steps between loss-scale growth attempts.
@@ -105,6 +143,7 @@ class AXSTrainingPipelineUnified:
         self,
         model: nn.Module,
         optimizer: Optimizer,
+        scheduler: LRScheduler | None = None,
         warmup_steps: int = 0,
         loss_scale_init: float = 2.0 ** 16,
         loss_scale_growth_interval: int = 2000,
@@ -116,12 +155,14 @@ class AXSTrainingPipelineUnified:
     ) -> None:
         self.model = model
         self.optimizer = optimizer
+        self.scheduler = scheduler
 
         # Warmup
         self.warmup_steps = warmup_steps
 
         # Loss scaling
         self.loss_scale = loss_scale_init
+        self._loss_scale_init = loss_scale_init
         self.growth_interval = loss_scale_growth_interval
         self.backoff = loss_scale_backoff
         self.growth = loss_scale_growth
@@ -137,10 +178,11 @@ class AXSTrainingPipelineUnified:
         self._grad_norms: list[float] = []
 
     def _set_warmup(self, active: bool) -> None:
-        """Set the warmup flag on all unified layers."""
+        """Set the warmup flag on all AXS-6 layers (unified + BF16)."""
+        warmup_types = _get_warmup_types()
         for module in self.model.modules():
-            if isinstance(module, (AXSLinearUnified, AXSEmbeddingUnified)):
-                module._warmup_active = active
+            if isinstance(module, warmup_types):
+                module._warmup_active = active  # type: ignore[union-attr]
 
     @property
     def is_warmup(self) -> bool:
@@ -161,7 +203,7 @@ class AXSTrainingPipelineUnified:
 
         Returns:
             Dict with keys: ``loss``, ``loss_scale``, ``grad_norm``,
-            ``overflow``, ``step``, ``warmup``.
+            ``overflow``, ``step``, ``warmup``, ``lr``.
         """
         self.model.train()
         self.optimizer.zero_grad()
@@ -196,6 +238,7 @@ class AXSTrainingPipelineUnified:
                 "overflow": True,
                 "step": self._total_steps,
                 "warmup": warmup,
+                "lr": self._current_lr(),
             }
 
         # Clip gradients
@@ -207,6 +250,10 @@ class AXSTrainingPipelineUnified:
 
         # Optimiser step
         self.optimizer.step()
+
+        # Scheduler step (per-batch)
+        if self.scheduler is not None:
+            self.scheduler.step()
 
         # Update loss scale
         self._steps_since_scale_change += 1
@@ -223,7 +270,12 @@ class AXSTrainingPipelineUnified:
             "overflow": False,
             "step": self._total_steps,
             "warmup": warmup,
+            "lr": self._current_lr(),
         }
+
+    def _current_lr(self) -> float:
+        """Return the current learning rate from the first param group."""
+        return self.optimizer.param_groups[0]["lr"]
 
     def _check_overflow(self) -> bool:
         for param in self.model.parameters():
@@ -231,6 +283,108 @@ class AXSTrainingPipelineUnified:
                 if torch.any(torch.isinf(param.grad)) or torch.any(torch.isnan(param.grad)):
                     return True
         return False
+
+    # ------------------------------------------------------------------
+    # Checkpoint save / load
+    # ------------------------------------------------------------------
+
+    def save_checkpoint(
+        self,
+        path: str | Path,
+        *,
+        extra: dict[str, Any] | None = None,
+    ) -> Path:
+        """
+        Save full training state to a checkpoint file.
+
+        Saves: model state_dict, optimiser state_dict, scheduler state_dict,
+        loss scale, step counters, overflow history, and CUDA RNG state.
+
+        Args:
+            path: File path for the checkpoint (``.pt`` extension recommended).
+            extra: Optional dict of user data (e.g. epoch, best_loss).
+
+        Returns:
+            The resolved Path that was written.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        state: dict[str, Any] = {
+            "model": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "total_steps": self._total_steps,
+            "loss_scale": self.loss_scale,
+            "steps_since_scale_change": self._steps_since_scale_change,
+            "overflow_count": self._overflow_count,
+            "warmup_steps": self.warmup_steps,
+        }
+
+        if self.scheduler is not None:
+            state["scheduler"] = self.scheduler.state_dict()
+
+        if self.amax_ema is not None:
+            state["amax_ema"] = self.amax_ema.state_dict()
+
+        # Save RNG state for exact reproducibility
+        state["rng"] = {
+            "python": torch.random.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+        }
+
+        if extra is not None:
+            state["extra"] = extra
+
+        torch.save(state, path)
+        logger.info("Saved checkpoint to %s (step %d)", path, self._total_steps)
+        return path
+
+    def load_checkpoint(
+        self,
+        path: str | Path,
+        *,
+        map_location: str | torch.device | None = None,
+    ) -> dict[str, Any]:
+        """
+        Restore full training state from a checkpoint file.
+
+        Args:
+            path: Checkpoint file path.
+            map_location: Device mapping (e.g. ``'cuda:0'``).
+
+        Returns:
+            The ``extra`` dict that was saved, or ``{}`` if none.
+        """
+        path = Path(path)
+        state = torch.load(path, map_location=map_location, weights_only=False)
+
+        self.model.load_state_dict(state["model"])
+        self.optimizer.load_state_dict(state["optimizer"])
+
+        self._total_steps = state["total_steps"]
+        self.loss_scale = state["loss_scale"]
+        self._steps_since_scale_change = state.get("steps_since_scale_change", 0)
+        self._overflow_count = state.get("overflow_count", 0)
+        self.warmup_steps = state.get("warmup_steps", self.warmup_steps)
+
+        if self.scheduler is not None and "scheduler" in state:
+            self.scheduler.load_state_dict(state["scheduler"])
+
+        if self.amax_ema is not None and "amax_ema" in state:
+            self.amax_ema.load_state_dict(state["amax_ema"])
+
+        # Restore RNG state
+        rng = state.get("rng", {})
+        if "python" in rng:
+            torch.random.set_rng_state(rng["python"])
+        if rng.get("cuda") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state(rng["cuda"])
+
+        logger.info(
+            "Loaded checkpoint from %s (step %d)",
+            path, self._total_steps,
+        )
+        return state.get("extra", {})
 
     @property
     def stats(self) -> dict[str, Any]:
@@ -245,4 +399,5 @@ class AXSTrainingPipelineUnified:
             "avg_grad_norm_recent": sum(recent_norms) / len(recent_norms),
             "max_grad_norm_recent": max(recent_norms),
             "amax_ema_active": self.amax_ema is not None,
+            "lr": self._current_lr(),
         }
