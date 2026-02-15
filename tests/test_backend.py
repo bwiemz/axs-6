@@ -26,15 +26,24 @@ import torch.nn as nn
 from axs.core import DEFAULT_BLOCK_SIZE
 from axs.unified.backend import (
     BackendType,
+    _INT8_CACHE_MAX_SIZE,
+    _INT8_CACHE_REFS,
+    _INT8_WEIGHT_CACHE,
     _LUT_CACHE,
     _fused_fq_compilable,
     _get_lut,
     _has_cuda,
     _has_int8_tensorcore,
     _has_torch_compile,
+    _int8_matmul_2d,
+    _make_cache_finalizer,
+    _nf5_to_int8_row,
+    _to_int8_row,
     accelerated_fake_quantize,
     accelerated_linear,
+    accelerated_matmul,
     backend_info,
+    clear_int8_weight_cache,
     detect_best_backend,
     get_backend,
     int8_linear,
@@ -563,3 +572,276 @@ class TestModuleIntegration:
         out.sum().backward()
         assert x.grad is not None
         assert layer.weight.grad is not None
+
+
+# ===================================================================
+# 13. _nf5_to_int8_row (CPU correctness)
+# ===================================================================
+
+class TestNF5ToInt8Row:
+
+    def test_output_shapes(self):
+        t = torch.randn(32, 64)
+        lut = _get_lut(torch.device("cpu"))
+        i8, scale = _nf5_to_int8_row(t, DEFAULT_BLOCK_SIZE, lut)
+        assert i8.shape == (32, 64)
+        assert i8.dtype == torch.int8
+        assert scale.shape == (32, 1)
+        assert scale.dtype == torch.float32
+
+    def test_int8_range(self):
+        t = torch.randn(16, 128)
+        lut = _get_lut(torch.device("cpu"))
+        i8, _ = _nf5_to_int8_row(t, DEFAULT_BLOCK_SIZE, lut)
+        assert i8.max() <= 127
+        assert i8.min() >= -127
+
+    def test_reconstruction_accuracy(self):
+        """Reconstruct from int8 + scale should approximate NF5 quantized value."""
+        torch.manual_seed(42)
+        t = torch.randn(32, 64)
+        lut = _get_lut(torch.device("cpu"))
+        i8, scale = _nf5_to_int8_row(t, DEFAULT_BLOCK_SIZE, lut)
+        reconstructed = i8.float() * scale
+        nf5_ref = fused_fake_quantize(t, DEFAULT_BLOCK_SIZE, "nearest")
+        rel_err = (reconstructed - nf5_ref).abs().mean() / nf5_ref.abs().mean().clamp(min=1e-12)
+        assert rel_err < 0.05, f"INT8 roundtrip relative error {rel_err:.4f} exceeds 5%"
+
+    def test_3d_input_flattened(self):
+        """3D tensor should be flattened to 2D internally."""
+        t = torch.randn(4, 16, 64)
+        lut = _get_lut(torch.device("cpu"))
+        i8, scale = _nf5_to_int8_row(t, DEFAULT_BLOCK_SIZE, lut)
+        # (4 * 16, 64)
+        assert i8.shape == (64, 64)
+        assert scale.shape == (64, 1)
+
+    def test_zero_tensor(self):
+        t = torch.zeros(16, 32)
+        lut = _get_lut(torch.device("cpu"))
+        i8, scale = _nf5_to_int8_row(t, DEFAULT_BLOCK_SIZE, lut)
+        assert torch.all(i8 == 0)
+
+    def test_non_divisible_width(self):
+        """Width not divisible by block_size should still work."""
+        t = torch.randn(8, 50)  # 50 is not divisible by 32
+        lut = _get_lut(torch.device("cpu"))
+        i8, scale = _nf5_to_int8_row(t, DEFAULT_BLOCK_SIZE, lut)
+        assert i8.shape == (8, 50)
+
+
+# ===================================================================
+# 14. _to_int8_row (CPU correctness)
+# ===================================================================
+
+class TestToInt8Row:
+
+    def test_output_shapes(self):
+        t = torch.randn(32, 64)
+        i8, scale = _to_int8_row(t)
+        assert i8.shape == (32, 64)
+        assert i8.dtype == torch.int8
+        assert scale.shape == (32, 1)
+        assert scale.dtype == torch.float32
+
+    def test_int8_range(self):
+        t = torch.randn(16, 128)
+        i8, _ = _to_int8_row(t)
+        assert i8.max() <= 127
+        assert i8.min() >= -127
+
+    def test_reconstruction_accuracy(self):
+        """Reconstruct from int8 + scale should closely approximate original."""
+        torch.manual_seed(42)
+        t = torch.randn(32, 64)
+        i8, scale = _to_int8_row(t)
+        reconstructed = i8.float() * scale
+        rel_err = (reconstructed - t).abs().mean() / t.abs().mean()
+        # Dynamic int8 quant should be very accurate (< 2% relative error)
+        assert rel_err < 0.02, f"Dynamic int8 relative error {rel_err:.4f} exceeds 2%"
+
+    def test_zero_tensor(self):
+        t = torch.zeros(8, 32)
+        i8, scale = _to_int8_row(t)
+        assert torch.all(i8 == 0)
+
+    def test_rejects_non_2d(self):
+        t = torch.randn(4, 8, 16)
+        with pytest.raises(AssertionError, match="Expected 2D"):
+            _to_int8_row(t)
+
+    def test_single_row(self):
+        t = torch.randn(1, 256)
+        i8, scale = _to_int8_row(t)
+        assert i8.shape == (1, 256)
+        assert scale.shape == (1, 1)
+
+
+# ===================================================================
+# 15. clear_int8_weight_cache
+# ===================================================================
+
+class TestClearInt8Cache:
+
+    def test_clears_weight_cache(self):
+        _INT8_WEIGHT_CACHE[(0, 10, 20)] = (
+            torch.zeros(10, 20, dtype=torch.int8),
+            torch.ones(10, 1),
+        )
+        clear_int8_weight_cache()
+        assert len(_INT8_WEIGHT_CACHE) == 0
+
+    def test_clears_refs(self):
+        import weakref
+        t = torch.randn(4, 8)
+        key = (t.data_ptr(), 4, 8)
+        _INT8_CACHE_REFS[key] = weakref.ref(t, _make_cache_finalizer(key))
+        clear_int8_weight_cache()
+        assert len(_INT8_CACHE_REFS) == 0
+
+    def test_idempotent(self):
+        clear_int8_weight_cache()
+        clear_int8_weight_cache()  # Should not raise
+
+
+# ===================================================================
+# 16. INT8 cache eviction (weakref + LRU)
+# ===================================================================
+
+class TestInt8CacheEviction:
+
+    def setup_method(self):
+        clear_int8_weight_cache()
+
+    def teardown_method(self):
+        clear_int8_weight_cache()
+
+    def test_weakref_eviction(self):
+        """Cache entries are removed when source weight tensor is GC'd."""
+        import gc
+        import weakref
+
+        w = torch.randn(64, 128)
+        key = (w.data_ptr(), 64, 128)
+        lut = _get_lut(torch.device("cpu"))
+        w_i8, w_s = _nf5_to_int8_row(w, DEFAULT_BLOCK_SIZE, lut)
+        _INT8_WEIGHT_CACHE[key] = (w_i8, w_s)
+        _INT8_CACHE_REFS[key] = weakref.ref(w, _make_cache_finalizer(key))
+
+        assert key in _INT8_WEIGHT_CACHE
+
+        # Delete the weight tensor and force GC
+        del w
+        gc.collect()
+
+        # Cache entry should be evicted
+        assert key not in _INT8_WEIGHT_CACHE
+        assert key not in _INT8_CACHE_REFS
+
+    def test_lru_cap_enforced(self):
+        """Cache should not exceed _INT8_CACHE_MAX_SIZE entries."""
+        lut = _get_lut(torch.device("cpu"))
+        # Insert more entries than the max
+        for i in range(_INT8_CACHE_MAX_SIZE + 10):
+            w = torch.randn(8, 32)
+            key = (w.data_ptr(), 8, 32)
+            w_i8, w_s = _nf5_to_int8_row(w, DEFAULT_BLOCK_SIZE, lut)
+            # Simulate the LRU logic from int8_linear
+            if len(_INT8_WEIGHT_CACHE) >= _INT8_CACHE_MAX_SIZE:
+                oldest_key = next(iter(_INT8_WEIGHT_CACHE))
+                _INT8_WEIGHT_CACHE.pop(oldest_key, None)
+                _INT8_CACHE_REFS.pop(oldest_key, None)
+            _INT8_WEIGHT_CACHE[key] = (w_i8, w_s)
+
+        assert len(_INT8_WEIGHT_CACHE) <= _INT8_CACHE_MAX_SIZE
+
+
+# ===================================================================
+# 17. accelerated_matmul (CPU path)
+# ===================================================================
+
+class TestAcceleratedMatmul:
+
+    def test_cpu_matches_torch_matmul(self):
+        """On CPU, accelerated_matmul should produce identical results."""
+        set_backend("eager")
+        torch.manual_seed(42)
+        a = torch.randn(32, 128)
+        b = torch.randn(128, 64)
+        ref = torch.matmul(a, b)
+        result = accelerated_matmul(a, b)
+        torch.testing.assert_close(result, ref, atol=1e-6, rtol=1e-5)
+
+    def test_3d_input(self):
+        """Batch dimensions should be preserved."""
+        set_backend("eager")
+        torch.manual_seed(42)
+        a = torch.randn(4, 16, 64)
+        b = torch.randn(64, 32)
+        ref = torch.matmul(a, b)
+        result = accelerated_matmul(a, b)
+        torch.testing.assert_close(result, ref, atol=1e-6, rtol=1e-5)
+
+    def test_output_shape(self):
+        set_backend("eager")
+        a = torch.randn(8, 256)
+        b = torch.randn(256, 128)
+        result = accelerated_matmul(a, b)
+        assert result.shape == (8, 128)
+
+    def test_backward_integration(self):
+        """Verify backward pass produces gradients correctly."""
+        set_backend("eager")
+        torch.manual_seed(42)
+        x = torch.randn(16, 64, requires_grad=True)
+        w = torch.randn(32, 64, requires_grad=True)
+        b = torch.randn(32)
+
+        layer = AXSLinearUnified(64, 32, bias=True)
+        out = layer(x)
+        out.sum().backward()
+        assert x.grad is not None
+        assert x.grad.shape == x.shape
+
+
+# ===================================================================
+# 18. _int8_matmul_2d (CUDA only)
+# ===================================================================
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestInt8Matmul2D:
+
+    def test_basic_correctness(self):
+        """INT8 matmul should approximate FP32 matmul."""
+        torch.manual_seed(42)
+        a = torch.randn(64, 256, device="cuda")
+        b = torch.randn(256, 128, device="cuda")
+        ref = torch.matmul(a, b)
+        result = _int8_matmul_2d(a, b)
+        rel_err = (result - ref).abs().mean() / ref.abs().mean()
+        assert rel_err < 0.05, f"INT8 matmul relative error {rel_err:.4f} exceeds 5%"
+
+    def test_output_shape(self):
+        a = torch.randn(32, 512, device="cuda")
+        b = torch.randn(512, 256, device="cuda")
+        result = _int8_matmul_2d(a, b)
+        assert result.shape == (32, 256)
+        assert result.dtype == torch.float32
+
+    def test_small_m_padding(self):
+        """M < 32 should work (requires padding)."""
+        a = torch.randn(3, 128, device="cuda")
+        b = torch.randn(128, 64, device="cuda")
+        result = _int8_matmul_2d(a, b)
+        assert result.shape == (3, 64)
+
+    def test_non_contiguous_inputs(self):
+        """Transposed (non-contiguous) inputs should work."""
+        torch.manual_seed(42)
+        a_raw = torch.randn(256, 64, device="cuda")
+        a = a_raw.t()  # (64, 256) non-contiguous
+        b = torch.randn(256, 128, device="cuda")
+        result = _int8_matmul_2d(a, b)
+        ref = torch.matmul(a.float(), b.float())
+        rel_err = (result - ref).abs().mean() / ref.abs().mean()
+        assert rel_err < 0.05

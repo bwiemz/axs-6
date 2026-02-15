@@ -43,6 +43,7 @@ import enum
 import functools
 import logging
 import os
+import weakref
 from typing import Literal
 
 import torch
@@ -259,6 +260,25 @@ def _get_compiled_fq(stochastic: bool = False) -> callable:
 # Keys: (data_ptr, out_features, in_features) for safe cache invalidation.
 _INT8_WEIGHT_CACHE: dict[tuple[int, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
 
+# Weakrefs to source weight tensors — auto-evict cache entries when
+# the model owning the weight is garbage-collected.
+_INT8_CACHE_REFS: dict[tuple[int, int, int], weakref.ref] = {}
+
+# Safety cap: prevent unbounded growth in multi-model / eval scenarios.
+_INT8_CACHE_MAX_SIZE: int = 64
+
+
+def _make_cache_finalizer(
+    key: tuple[int, int, int],
+) -> callable:
+    """Create a weakref callback that removes a stale cache entry."""
+
+    def _on_weight_freed(_ref: weakref.ref) -> None:  # noqa: ARG001
+        _INT8_WEIGHT_CACHE.pop(key, None)
+        _INT8_CACHE_REFS.pop(key, None)
+
+    return _on_weight_freed
+
 
 def _nf5_to_int8_row(
     tensor: torch.Tensor,
@@ -305,6 +325,68 @@ def _nf5_to_int8_row(
     row_scale = row_amax / 127.0
 
     return int8_vals, row_scale
+
+
+def _to_int8_row(
+    tensor: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Per-row dynamic INT8 quantization (no NF5 step).
+
+    Takes a 2D float tensor and returns int8-encoded values + per-row scale.
+    Useful for encoding already-quantized tensors (e.g., backward gradients).
+
+    Returns:
+        int8_tensor: ``[rows, cols]`` int8
+        row_scale: ``[rows, 1]`` float32
+    """
+    assert tensor.ndim == 2, f"Expected 2D tensor, got {tensor.ndim}D"
+    t = tensor.float()
+    row_amax = t.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+    int8_vals = (t / row_amax * 127).round().clamp(-127, 127).to(torch.int8)
+    row_scale = row_amax / 127.0
+    return int8_vals, row_scale
+
+
+def _int8_matmul_2d(
+    a: torch.Tensor,
+    b: torch.Tensor,
+) -> torch.Tensor:
+    """
+    INT8 tensor core matmul: ``A (M, K) @ B (K, N) → (M, N)`` float32.
+
+    Uses per-row dynamic int8 scaling for *A* and per-column scaling for *B*
+    (implemented as per-row scaling of ``B^T``).
+
+    Both inputs should be 2D float tensors.  The result is always float32.
+    """
+    a = a.contiguous().float()
+    b = b.contiguous().float()
+    M, K = a.shape
+    K2, N = b.shape
+    assert K == K2, f"Inner dimensions must match: {K} vs {K2}"
+
+    # Encode A per-row
+    a_i8, a_s = _to_int8_row(a)
+
+    # Encode B per-column (= B^T per-row then transpose back)
+    bt_i8, bt_s = _to_int8_row(b.t().contiguous())
+    b_col_i8 = bt_i8.t().contiguous()  # (K, N) int8
+
+    # Pad M to multiple of 32 (torch._int_mm alignment requirement)
+    M_pad = (32 - M % 32) % 32
+    if M_pad > 0:
+        a_i8 = F.pad(a_i8, (0, 0, 0, M_pad))
+
+    # INT8 tensor core GEMM
+    result_int = torch._int_mm(a_i8, b_col_i8)  # (M_padded, N) int32
+
+    # Scale correction and remove padding
+    if M_pad > 0:
+        result_int = result_int[:M]
+
+    # a_s: (M, 1), bt_s: (N, 1) → bt_s.t(): (1, N)
+    return result_int.float() * a_s * bt_s.t()
 
 
 def _pad_to_multiple(tensor: torch.Tensor, dim: int, multiple: int) -> torch.Tensor:
@@ -362,7 +444,19 @@ def int8_linear(
         w_i8, w_s = cached
     else:
         w_i8, w_s = _nf5_to_int8_row(weight, block_size, lut)
+        # LRU eviction: drop oldest entry when cache is at capacity
+        if len(_INT8_WEIGHT_CACHE) >= _INT8_CACHE_MAX_SIZE:
+            oldest_key = next(iter(_INT8_WEIGHT_CACHE))
+            _INT8_WEIGHT_CACHE.pop(oldest_key, None)
+            _INT8_CACHE_REFS.pop(oldest_key, None)
         _INT8_WEIGHT_CACHE[w_key] = (w_i8, w_s)
+        # Auto-evict when the source weight tensor is garbage-collected
+        try:
+            _INT8_CACHE_REFS[w_key] = weakref.ref(
+                weight, _make_cache_finalizer(w_key),
+            )
+        except TypeError:
+            pass  # Some tensor subclasses may not support weakref
 
     # Pad M to multiple of 32 (torch._int_mm alignment requirement)
     M_pad = (32 - M % 32) % 32
@@ -524,6 +618,59 @@ def accelerated_linear(
     return F.linear(x_q, w_q, bias)
 
 
+def accelerated_matmul(
+    a: torch.Tensor,
+    b: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Matrix multiply using the best available backend.
+
+    For INT8/Triton backends with large CUDA matrices, uses INT8 tensor
+    cores (``_int_mm``).  For other CUDA cases, uses BF16 tensor cores.
+    Falls back to standard matmul on CPU.
+
+    This is intended for backward‑pass matmuls where operands are already
+    fake‑quantised, so **no** NF5 step is applied — only the GEMM is
+    accelerated.
+
+    Args:
+        a: Left operand ``(*, K)`` or ``(M, K)``.
+        b: Right operand ``(K, N)`` — must be 2‑D.
+
+    Returns:
+        Result in float32.
+    """
+    # CPU — nothing to accelerate
+    if not a.is_cuda:
+        return torch.matmul(a, b)
+
+    backend = get_backend()
+
+    # Flatten *a* to 2‑D for size‑based dispatch
+    orig_shape = a.shape
+    a_2d = a.reshape(-1, a.shape[-1])
+    M, K = a_2d.shape
+    N = b.shape[-1]
+
+    # INT8 tensor‑core path for large matrices
+    if (
+        backend in (BackendType.INT8, BackendType.TRITON)
+        and _has_int8_tensorcore()
+        and K >= 512
+        and N >= 512
+    ):
+        try:
+            result_2d = _int8_matmul_2d(a_2d, b.reshape(-1, N))
+            return result_2d.reshape(orig_shape[:-1] + (N,))
+        except Exception:
+            logger.debug("INT8 matmul fallback to BF16", exc_info=True)
+
+    # BF16 tensor‑core path (all modern CUDA GPUs)
+    return torch.matmul(
+        a.to(torch.bfloat16), b.to(torch.bfloat16),
+    ).float()
+
+
 # ---------------------------------------------------------------------------
 # Info / diagnostic
 # ---------------------------------------------------------------------------
@@ -547,3 +694,4 @@ def backend_info() -> dict[str, object]:
 def clear_int8_weight_cache() -> None:
     """Clear the INT8 weight encoding cache (call after optimizer.step())."""
     _INT8_WEIGHT_CACHE.clear()
+    _INT8_CACHE_REFS.clear()

@@ -27,6 +27,7 @@ from axs.unified.quantize_unified import fused_fake_quantize
 from axs.unified.backend import (
     accelerated_fake_quantize as _accel_fq,
     accelerated_linear as _accel_linear,
+    accelerated_matmul as _accel_mm,
 )
 
 
@@ -149,10 +150,14 @@ class _AXSLinearUnifiedFunction(torch.autograd.Function):
         if quantize_grad:
             grad_output = _accel_fq(grad_output, block_size, "stochastic")
 
-        grad_input = grad_output @ weight_q if ctx.needs_input_grad[0] else None  # type: ignore[index]
+        # Backward matmuls: use INT8 tensor cores or BF16 tensor cores
+        # when on CUDA (same acceleration as the forward path).
+        grad_input = _accel_mm(grad_output, weight_q) if ctx.needs_input_grad[0] else None  # type: ignore[index]
         grad_weight = (
-            grad_output.reshape(-1, grad_output.shape[-1]).T
-            @ input_q.reshape(-1, input_q.shape[-1])
+            _accel_mm(
+                grad_output.reshape(-1, grad_output.shape[-1]).t().contiguous(),
+                input_q.reshape(-1, input_q.shape[-1]),
+            )
             if ctx.needs_input_grad[1]  # type: ignore[index]
             else None
         )

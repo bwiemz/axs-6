@@ -30,6 +30,11 @@ from axs.unified.functional_unified import (
     fake_quantize_unified,
 )
 
+# Module-level constant: ``nn.RMSNorm`` availability is fixed for the
+# lifetime of the process, so detect it once here instead of on every
+# call to :func:`convert_to_axs_unified`.
+_HAS_RMSNORM: bool = hasattr(nn, "RMSNorm")
+
 
 # ---------------------------------------------------------------------------
 # Linear
@@ -303,11 +308,8 @@ def convert_to_axs_unified(
     # We handle nn.LayerNorm (converted to AXSLayerNormUnified) and
     # explicitly skip RMSNorm variants (they don't need quantisation).
     _NORM_TYPES: tuple[type, ...] = (nn.LayerNorm, AXSLayerNorm, AXSLayerNormV2)
-    try:
-        # PyTorch 2.4+ has nn.RMSNorm
+    if _HAS_RMSNORM:
         _NORM_TYPES = _NORM_TYPES + (nn.RMSNorm,)  # type: ignore[attr-defined]
-    except AttributeError:
-        pass
 
     def _convert(module: nn.Module, prefix: str = "") -> None:
         for name, child in module.named_children():
