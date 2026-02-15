@@ -53,6 +53,7 @@ from axs.unified.training_unified import (
 from axs.unified.triton_kernels import (
     has_triton,
     triton_fused_fake_quantize,
+    triton_fused_linear,
 )
 
 __all__ = [
@@ -87,4 +88,5 @@ __all__ = [
     # Triton kernels
     "has_triton",
     "triton_fused_fake_quantize",
+    "triton_fused_linear",
 ]

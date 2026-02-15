@@ -428,18 +428,37 @@ def accelerated_linear(
             return int8_linear(input, weight, bias, block_size)
         # Fall through to compiled for small matrices
 
-    # Triton path: custom kernel FQ + FP32 matmul
+    # Triton path: fused kernel for small matrices, separate FQ+cuBLAS for large
     if backend == BackendType.TRITON:
         try:
-            from axs.unified.triton_kernels import triton_fused_fake_quantize
-
-            w_q = triton_fused_fake_quantize(weight, block_size, "nearest")
-            x_q = (
-                triton_fused_fake_quantize(input, block_size, "nearest")
-                if quantize_input
-                else input
+            from axs.unified.triton_kernels import (
+                _FUSED_SIZE_THRESHOLD,
+                triton_fused_fake_quantize,
+                triton_fused_linear,
             )
-            return F.linear(x_q, w_q, bias)
+
+            # Size-based dispatch: the fused kernel keeps FQ'd values in
+            # registers (no intermediate writes) but its matmul can't compete
+            # with cuBLAS for large matrices.
+            M_flat = input.reshape(-1, input.shape[-1]).shape[0]
+            N = weight.shape[0]
+            use_fused = (
+                block_size == 32
+                and M_flat * N <= _FUSED_SIZE_THRESHOLD
+            )
+
+            if use_fused:
+                return triton_fused_linear(
+                    input, weight, bias, block_size, quantize_input,
+                )
+            else:
+                w_q = triton_fused_fake_quantize(weight, block_size, "nearest")
+                x_q = (
+                    triton_fused_fake_quantize(input, block_size, "nearest")
+                    if quantize_input
+                    else input
+                )
+                return F.linear(x_q, w_q, bias)
         except Exception:
             logger.warning("Triton kernel failed in linear, falling back to compiled")
             set_backend("compiled")
