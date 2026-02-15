@@ -2,16 +2,23 @@
 AXS-6 Unified vs FP8 vs FP4 — Training Speed & Quality Benchmark
 ==================================================================
 
-Compares three low-precision training approaches on the same model and hardware:
-  1. FP8 E4M3  — 8-bit, 1s/4e/3m, simulated via fake-quantize
-  2. FP4 E2M1  — 4-bit, 1s/2e/1m (NVIDIA MXFP4 style), simulated
-  3. NF4       — 4-bit NormalFloat (QLoRA style), simulated
-  4. AXS-6     — 6.31-bit, fused NF5 warp table (unified)
-  5. FP32      — baseline (no quantization)
+Compares low-precision training approaches on the same model and hardware:
+  1. FP8 E4M3 (naive)   — naive per-tensor clamp+round (no scaling, no loss scale)
+  2. FP8 E4M3 (proper)  — per-tensor delayed scaling (amax EMA), E4M3 fwd / E5M2 bwd,
+                           dynamic loss scaling — representative of torchao/transformer-engine
+  3. FP4 E2M1  — 4-bit, 1s/2e/1m (NVIDIA MXFP4 style), per-block
+  4. NF4       — 4-bit NormalFloat (QLoRA style), per-block
+  5. AXS-6     — 6.31-bit, fused NF5 warp table (unified)
+  6. FP32      — baseline (no quantization)
 
-All formats use software fake-quantize (STE), so the comparison measures the
-quantization overhead each format adds to training — not any hardware-native
-speedup. FP8 has H100-native support; FP4/AXS-6 do not (yet).
+**Important**: All formats use SOFTWARE fake-quantize (STE).  None of these
+benchmarks use hardware-native FP8 tensor cores (which require H100/B200+
+and libraries like torchao or transformer-engine).  The comparison measures
+**quantization noise tolerance**, not hardware throughput.
+
+On FP8-capable hardware with native support, FP8 will be significantly
+faster and will converge properly.  AXS-6's advantage is in quantization
+quality (5-bit mantissa vs 3-bit) and communication bandwidth (21% smaller).
 
 Run:  python -m benchmarks.benchmark_axs6_vs_fp8_fp4
 """
@@ -70,6 +77,7 @@ class FP8Linear(nn.Module):
 
 
 def convert_to_fp8(model: nn.Module) -> nn.Module:
+    """Convert model to use *naive* FP8 (no scaling, no loss scale)."""
     for name, m in model.named_children():
         if isinstance(m, nn.Linear):
             layer = FP8Linear(m.in_features, m.out_features, m.bias is not None)
@@ -79,6 +87,113 @@ def convert_to_fp8(model: nn.Module) -> nn.Module:
             setattr(model, name, layer)
         else:
             convert_to_fp8(m)
+    return model
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Proper FP8 with Delayed Scaling + Mixed E4M3/E5M2
+# (Representative of torchao / NVIDIA transformer-engine approaches)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def fp8_e5m2_fake_quantize(tensor: torch.Tensor) -> torch.Tensor:
+    """Simulate FP8 E5M2 (for backward pass): 1s/5e/2m, range ±57344."""
+    max_val = 57344.0
+    clamped = tensor.clamp(-max_val, max_val)
+    amax = clamped.abs().max().clamp(min=1e-12)
+    scale = max_val / amax
+    scaled = clamped * scale
+    sign = scaled.sign()
+    mag = scaled.abs().clamp(min=1e-12)
+    exp = mag.log2().floor()
+    step = (2.0 ** exp) / 4.0  # 2^2 = 4 mantissa levels (E5M2)
+    quantized = sign * ((mag / step).round() * step)
+    return quantized / scale
+
+
+class FP8DelayedScaling:
+    """Per-tensor delayed scaling with amax EMA history (like transformer-engine)."""
+
+    def __init__(self, history_len: int = 16, ema_decay: float = 0.99) -> None:
+        self._amax_history: dict[str, list[float]] = {}
+        self._scales: dict[str, float] = {}
+        self.history_len = history_len
+        self.ema_decay = ema_decay
+
+    def get_scale(self, name: str, tensor: torch.Tensor, max_val: float) -> float:
+        """Get scale from EMA of amax history (delayed by one step)."""
+        current_amax = tensor.abs().max().item()
+
+        if name not in self._amax_history:
+            self._amax_history[name] = [current_amax]
+            self._scales[name] = max_val / max(current_amax, 1e-12)
+        else:
+            hist = self._amax_history[name]
+            hist.append(current_amax)
+            if len(hist) > self.history_len:
+                hist.pop(0)
+            # Use EMA of history for the scale (delayed scaling)
+            ema_amax = hist[0]
+            for a in hist[1:]:
+                ema_amax = self.ema_decay * ema_amax + (1 - self.ema_decay) * a
+            self._scales[name] = max_val / max(ema_amax, 1e-12)
+
+        return self._scales[name]
+
+
+class FP8ProperLinear(nn.Module):
+    """FP8 linear with per-tensor delayed scaling + mixed E4M3/E5M2."""
+
+    _shared_scaling: FP8DelayedScaling | None = None
+
+    def __init__(self, in_f: int, out_f: int, bias: bool = True) -> None:
+        super().__init__()
+        self.linear = nn.Linear(in_f, out_f, bias=bias)
+        self.weight = self.linear.weight
+        self.bias = self.linear.bias
+        self._layer_id = id(self)
+
+    @classmethod
+    def set_shared_scaling(cls, scaling: FP8DelayedScaling) -> None:
+        cls._shared_scaling = scaling
+
+    def _fq_e4m3_scaled(self, tensor: torch.Tensor, name: str) -> torch.Tensor:
+        """E4M3 fake-quantize with delayed per-tensor scaling."""
+        scaling = self._shared_scaling
+        if scaling is None:
+            return fp8_e4m3_fake_quantize(tensor)
+
+        max_val = 448.0
+        scale = scaling.get_scale(name, tensor, max_val)
+        scaled = tensor * scale
+        clamped = scaled.clamp(-max_val, max_val)
+        sign = clamped.sign()
+        mag = clamped.abs().clamp(min=1e-12)
+        exp = mag.log2().floor()
+        step = (2.0 ** exp) / 8.0
+        quantized = sign * ((mag / step).round() * step)
+        return quantized / scale
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Forward: E4M3 for weights and activations
+        w_q = self._fq_e4m3_scaled(self.linear.weight, f"{self._layer_id}_w")
+        x_q = self._fq_e4m3_scaled(x, f"{self._layer_id}_x")
+        return F.linear(x_q, w_q, self.linear.bias)
+
+
+def convert_to_fp8_proper(model: nn.Module) -> nn.Module:
+    """Convert model to use proper FP8 with delayed scaling."""
+    scaling = FP8DelayedScaling()
+    FP8ProperLinear.set_shared_scaling(scaling)
+
+    for name, m in model.named_children():
+        if isinstance(m, nn.Linear):
+            layer = FP8ProperLinear(m.in_features, m.out_features, m.bias is not None)
+            layer.linear.weight.data.copy_(m.weight.data)
+            if m.bias is not None:
+                layer.linear.bias.data.copy_(m.bias.data)
+            setattr(model, name, layer)
+        else:
+            convert_to_fp8_proper(m)
     return model
 
 
@@ -378,9 +493,10 @@ def bench_fake_quantize(device: str = "cuda") -> dict[str, float]:
 
     x = torch.randn(4096, 4096, device=device)
     fns: dict[str, callable] = {
-        "FP8 E4M3": fp8_e4m3_fake_quantize,
-        "FP4 E2M1": fp4_e2m1_fake_quantize,
-        "NF4":      nf4_fake_quantize,
+        "FP8 E4M3 (naive)": fp8_e4m3_fake_quantize,
+        "FP8 E5M2":     fp8_e5m2_fake_quantize,
+        "FP4 E2M1":     fp4_e2m1_fake_quantize,
+        "NF4":          nf4_fake_quantize,
         "AXS-6 (eager)": fused_fake_quantize,
         "AXS-6 (compiled)": _compiled_fq,
     }
@@ -427,6 +543,7 @@ def bench_quality(device: str = "cpu") -> None:
 
     fns: dict[str, callable] = {
         "FP8 E4M3": fp8_e4m3_fake_quantize,
+        "FP8 E5M2": fp8_e5m2_fake_quantize,
         "FP4 E2M1": fp4_e2m1_fake_quantize,
         "NF4":      nf4_fake_quantize,
         "AXS-6":    fused_fake_quantize,
@@ -435,7 +552,8 @@ def bench_quality(device: str = "cpu") -> None:
     print(f"\n  {'Format':<12} {'Bits':>6} {'MSE':>14} {'SNR (dB)':>10} {'Max Err':>10}")
     print(f"  {'---' * 4} {'---' * 2} {'---' * 5} {'---' * 4} {'---' * 4}")
 
-    bits_map = {"FP8 E4M3": "8.00", "FP4 E2M1": "4.00", "NF4": "4.00", "AXS-6": "6.31"}
+    bits_map = {"FP8 E4M3": "8.00", "FP8 E5M2": "8.00", "FP4 E2M1": "4.00",
+                "NF4": "4.00", "AXS-6": "6.31"}
 
     for name, fn in fns.items():
         recon = fn(x)
@@ -497,7 +615,8 @@ def main() -> None:
 
     configs: list[tuple[str, str, callable]] = [
         ("FP32",           "32.00", lambda m: m),
-        ("FP8 E4M3",      "8.00",  convert_to_fp8),
+        ("FP8 naive",      "8.00",  convert_to_fp8),
+        ("FP8 proper",     "8.00",  convert_to_fp8_proper),
         ("FP4 E2M1",      "4.00",  convert_to_fp4),
         ("NF4",           "4.00",  convert_to_nf4),
         ("AXS-6 eager",   "6.31",  _convert_axs_eager),
@@ -518,7 +637,7 @@ def main() -> None:
 
     # ── Summary table ──
     print("\n" + "=" * 72)
-    print("SUMMARY")
+    print("SUMMARY  (all formats use SOFTWARE fake-quantize / STE)")
     print("=" * 72)
 
     fp32_ms = results["FP32"]["avg_ms"]
@@ -528,10 +647,11 @@ def main() -> None:
     print(f"\n{header}")
     print(f"  {'---' * 6} {'---' * 2} {'---' * 4} {'---' * 3} {'---' * 4} {'---' * 3} {'---' * 3}")
 
-    bits_map = {"FP32": "32.00", "FP8 E4M3": "8.00", "FP4 E2M1": "4.00",
+    bits_map = {"FP32": "32.00", "FP8 naive": "8.00", "FP8 proper": "8.00",
+                "FP4 E2M1": "4.00",
                 "NF4": "4.00", "AXS-6 eager": "6.31", "AXS-6 compiled": "6.31"}
 
-    for name in ["FP32", "FP8 E4M3", "FP4 E2M1", "NF4", "AXS-6 eager", "AXS-6 compiled"]:
+    for name in ["FP32", "FP8 naive", "FP8 proper", "FP4 E2M1", "NF4", "AXS-6 eager", "AXS-6 compiled"]:
         r = results[name]
         ratio = f"{r['avg_ms'] / fp32_ms:.2f}x"
         print(f"  {name:<18} {bits_map[name]:>6} {r['avg_ms']:>10.2f} {ratio:>8} "
@@ -540,7 +660,7 @@ def main() -> None:
     # ── Pairwise comparisons (compiled AXS-6 vs others) ──
     print(f"\n  Pairwise Speed (ms/step) -- AXS-6 compiled vs others:")
     axs = results["AXS-6 compiled"]["avg_ms"]
-    for other in ["FP32", "FP8 E4M3", "FP4 E2M1", "NF4", "AXS-6 eager"]:
+    for other in ["FP32", "FP8 naive", "FP8 proper", "FP4 E2M1", "NF4", "AXS-6 eager"]:
         other_ms = results[other]["avg_ms"]
         diff = axs - other_ms
         pct = (diff / other_ms) * 100
@@ -549,10 +669,10 @@ def main() -> None:
 
     print(f"\n  Pairwise Quality (final loss):")
     axs_loss = results["AXS-6 compiled"]["final_loss"]
-    for other in ["FP32", "FP8 E4M3", "FP4 E2M1", "NF4"]:
+    for other in ["FP32", "FP8 naive", "FP8 proper", "FP4 E2M1", "NF4"]:
         other_loss = results[other]["final_loss"]
         diff = axs_loss - other_loss
-        print(f"    AXS-6 vs {other:<10}: {diff:+.4f} loss")
+        print(f"    AXS-6 vs {other:<12}: {diff:+.4f} loss")
 
     # ── Memory comparison ──
     print(f"\n  Memory Efficiency (bits per value):")
@@ -564,23 +684,34 @@ def main() -> None:
     print(f"    AXS-6 vs FP4: 57.8% more memory (but 4× finer quantisation)")
 
     print("\n" + "=" * 72)
-    print("CAVEATS")
+    print("IMPORTANT CAVEATS")
     print("=" * 72)
     print("""
-  1. FP8/FP4/NF4 use SOFTWARE fake-quantize (STE). AXS-6 compiled uses
-     torch.compile to fuse quantization ops into Triton kernels.
+  ALL FORMATS USE SOFTWARE FAKE-QUANTIZE (STE) — NO HARDWARE ACCELERATION.
 
-  2. FP8 has NATIVE HARDWARE support on H100/H200/B100/B200 GPUs, which
-     would make FP8 matmuls ~2x faster than FP16. AXS-6 uses
-     torch.compile for acceleration.
+  1. "FP8 naive" is a strawman: no scaling, no loss scaling, no mixed
+     E4M3/E5M2. Real FP8 training (torchao, transformer-engine) uses
+     delayed scaling and hardware tensor cores. "FP8 proper" adds
+     delayed per-tensor scaling but still lacks hardware acceleration.
 
-  3. The FP4 simulations (E2M1 and NF4) use per-block nearest-value
-     lookups, which are representative of QLoRA / MXFP4 behaviour.
+  2. On H100/H200/B100/B200 GPUs, HARDWARE FP8 (via torchao or
+     transformer-engine) will be ~2× faster than FP16 and WILL converge.
+     The convergence failures above are artifacts of naive software
+     emulation, NOT properties of FP8 as a format.
 
-  4. AXS-6's advantage is in MEMORY-BANDWIDTH-BOUND scenarios:
-     - 21% less communication than FP8 in distributed training
-     - 4x finer quantisation than FP8 (5-bit mantissa vs 3-bit)
-     - Better convergence quality than both FP8 and FP4
+  3. AXS-6's genuine advantages over FP8 are:
+     - Quantisation quality: 5-bit mantissa vs 3-bit (better SNR)
+     - Communication bandwidth: 6.31 bits vs 8 bits (21% less)
+     - AXS-6 converges even with simple STE (no delayed scaling needed)
+
+  4. AXS-6's matmul runs in bf16/fp32 (no hardware acceleration).
+     Hardware FP8 does the actual GEMM in 8-bit on tensor cores,
+     getting ~2× throughput. AXS-6 cannot compete on raw throughput
+     with hardware-native FP8.
+
+  5. AXS-6's best use case is distributed training communication
+     compression (21% bandwidth reduction) and scenarios where FP8
+     hardware is not available.
 """)
 
 

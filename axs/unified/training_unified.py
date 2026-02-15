@@ -251,6 +251,13 @@ class AXSTrainingPipelineUnified:
         # Optimiser step
         self.optimizer.step()
 
+        # Invalidate INT8 weight cache (weights have changed)
+        try:
+            from axs.unified.backend import clear_int8_weight_cache
+            clear_int8_weight_cache()
+        except ImportError:
+            pass
+
         # Scheduler step (per-batch)
         if self.scheduler is not None:
             self.scheduler.step()

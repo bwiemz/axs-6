@@ -22,6 +22,7 @@ from axs.unified.backend import (
     accelerated_fake_quantize,
     accelerated_linear,
     backend_info,
+    clear_int8_weight_cache,
     detect_best_backend,
     get_backend,
     set_backend,
@@ -41,6 +42,7 @@ from axs.unified.modules_unified import (
 from axs.unified.quantize_unified import (
     FUSED_NF5_LUT,
     NF5_CODEBOOK,
+    REVERSE_NF5_LUT,
     dequantize_unified,
     fused_fake_quantize,
     quantization_error_unified,
@@ -70,6 +72,7 @@ __all__ = [
     "quantization_error_unified",
     "FUSED_NF5_LUT",
     "NF5_CODEBOOK",
+    "REVERSE_NF5_LUT",
     # Functional
     "fake_quantize_unified",
     "axs_linear_unified",
@@ -88,6 +91,7 @@ __all__ = [
     "accelerated_fake_quantize",
     "accelerated_linear",
     "backend_info",
+    "clear_int8_weight_cache",
     "detect_best_backend",
     "get_backend",
     "set_backend",

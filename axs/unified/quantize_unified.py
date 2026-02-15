@@ -98,6 +98,23 @@ _LUT_MAX_IDX: int = FUSED_NF5_LUT.shape[0] - 1  # 1023
 
 
 # ---------------------------------------------------------------------------
+# Reverse LUT: LUT index (0–1023) → NF5 code index (0–31)
+# Precomputed at import time so serialisation is O(1) per value.
+# ---------------------------------------------------------------------------
+
+def _build_reverse_lut() -> torch.Tensor:
+    """Map each LUT index to its nearest NF5 codebook entry index."""
+    codebook = NF5_CODEBOOK.double()
+    lut_vals = FUSED_NF5_LUT.double()
+    # shape: (1024, 32) → argmin over codebook dim
+    diff = (lut_vals.unsqueeze(-1) - codebook.unsqueeze(0)).abs()
+    return diff.argmin(dim=-1).to(torch.uint8)
+
+
+REVERSE_NF5_LUT: torch.Tensor = _build_reverse_lut()  # (1024,) uint8
+
+
+# ---------------------------------------------------------------------------
 # Core fused fake-quantize (the hot path)
 # ---------------------------------------------------------------------------
 
@@ -135,8 +152,9 @@ def fused_fake_quantize(
     assert block_size in VALID_BLOCK_SIZES, f"block_size must be one of {VALID_BLOCK_SIZES}"
     original_shape = tensor.shape
     device = tensor.device
+    orig_dtype = tensor.dtype
 
-    # Flatten to 2-D and pad last dim to a multiple of block_size
+    # Flatten to 2-D — compute in FP32 for LUT precision, restore dtype at end
     flat = tensor.reshape(-1, tensor.shape[-1]).float()
     last_dim = flat.shape[-1]
     pad_amount = (block_size - last_dim % block_size) % block_size
@@ -183,7 +201,7 @@ def fused_fake_quantize(
     if pad_amount > 0:
         result = result[:, :last_dim]
 
-    return result.reshape(original_shape)
+    return result.reshape(original_shape).to(orig_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -248,11 +266,9 @@ def quantize_unified(
 
     recon_values = lut[lut_idx.long()]
 
-    # Map reconstruction values back to NF5 code indices [0, 31]
-    codebook = NF5_CODEBOOK.to(device)
-    # Nearest codebook entry via absolute difference
-    diff = (recon_values.unsqueeze(-1) - codebook.unsqueeze(0).unsqueeze(0).unsqueeze(0)).abs()
-    magnitudes = diff.argmin(dim=-1).to(torch.uint8)
+    # Map LUT indices to NF5 code indices via precomputed reverse LUT (O(1))
+    rev_lut = REVERSE_NF5_LUT.to(device)
+    magnitudes = rev_lut[lut_idx.long()]
 
     signs = blocked < 0
 

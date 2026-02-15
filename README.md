@@ -4,11 +4,12 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.1+](https://img.shields.io/badge/pytorch-2.1+-ee4c2c.svg)](https://pytorch.org/)
 
-> **A novel 6-bit numerical format with a custom Triton kernel that trains 2× faster than eager PyTorch — and is the only sub-8-bit format that actually converges.**
+> **A novel 6-bit numerical format with 4× the mantissa precision of FP8, 21% less memory, and a custom Triton kernel that's 2× faster than eager PyTorch. Converges with simple STE — no delayed scaling or loss scaling required.**
 
 ## TL;DR — How AXS-6 Compares
 
-Measured on RTX 5070 Ti, MiniGPT (4-layer Transformer), 200 training steps:
+**Software fake-quantize comparison** on RTX 5070 Ti, MiniGPT (4-layer Transformer), 200 steps.
+All formats use STE (straight-through estimator) — no hardware-native acceleration.
 
 | Format | Bits | ms/step | vs FP32 | Final Loss | Perplexity | Converges? |
 |--------|------|---------|---------|------------|------------|:----------:|
@@ -16,15 +17,17 @@ Measured on RTX 5070 Ti, MiniGPT (4-layer Transformer), 200 training steps:
 | **AXS-6 (Triton)** | **6.31** | **11.70** | **1.27×** | **0.0537** | **1.06** | **Yes** |
 | NF4 | 4 | 18.57 | 2.01× | 6.8432 | 937 | No |
 | FP4 E2M1 | 4 | 24.74 | 2.68× | 6.8645 | 958 | No |
-| FP8 E4M3 | 8 | 30.01 | 3.26× | 7.1399 | 1261 | No |
+| FP8 E4M3 (naive) | 8 | 30.01 | 3.26× | 7.1399 | 1261 | No |
 
-**AXS-6 is the only quantised format that converges.** FP8, FP4, and NF4 all diverge to random-guess loss (~6.9 = ln(1000)).
+> **Note**: The FP8 result uses a naive software emulation (no delayed scaling, no loss scaling). Production FP8 training with proper infrastructure (torchao, transformer-engine) on FP8-capable hardware (H100/B200) **does converge** and is faster than AXS-6. See [Honest Comparison](#honest-comparison-axs-6-vs-hardware-fp8) below.
+
+**AXS-6's advantage**: it converges with simple STE — no delayed scaling, no amax history, no mixed E4M3/E5M2 — making it the most robust sub-8-bit format for software-level quantization.
 
 ## The Problem
 
-Modern AI training uses FP8 (8-bit floating point) as the frontier of low-precision training. But FP8's per-value exponent is wasteful — in neural networks, neighboring values (within a weight row, channel, or attention head) tend to have similar magnitudes. Each FP8 value redundantly encodes its own exponent.
+Modern AI training uses FP8 (8-bit floating point) as the frontier of low-precision training. FP8 works well with proper infrastructure (delayed scaling, mixed E4M3/E5M2, hardware tensor cores on H100+), but its per-value exponent is redundant — in neural networks, neighboring values within a weight row or channel tend to have similar magnitudes.
 
-Worse, standard FP8/FP4 fake-quantize simulations fail to converge on standard training tasks. The quantisation noise overwhelms the gradient signal.
+This redundancy means FP8 uses 8 bits per value but only gets 3 bits of mantissa precision. And without dedicated infrastructure (delayed scaling, loss scaling, mixed precision), naive FP8/FP4 STE simulations often fail to converge.
 
 ## Our Solution: AXS-6
 
@@ -53,7 +56,7 @@ Worse, standard FP8/FP4 fake-quantize simulations fail to converge on standard t
 | Quantisation levels | 16/scale | 4/scale | 63/scale | **~4× finer** |
 | Training convergence | No* | No* | **Yes** | — |
 
-*\*Using software fake-quantise (STE). FP8 may converge with hardware-native support on H100/B200.*
+*\*Using naive software STE without delayed scaling or loss scaling. FP8 converges with proper infrastructure (torchao/transformer-engine) on H100/B200. AXS-6 converges even with simple STE.*
 
 ## Core Innovation: Fused NF5 Warp Table + Triton Kernel
 
@@ -228,7 +231,9 @@ Block scales are constrained to powers of 2 (`2^(floor(log2(amax)) + 1)`), enabl
 
 All benchmarks on NVIDIA RTX 5070 Ti (16 GB), PyTorch 2.10, Python 3.14, Triton 3.6.
 
-### AXS-6 vs FP32 vs FP8 vs FP4 — Training Convergence
+### AXS-6 vs FP32 vs FP8 vs FP4 — Software Fake-Quantize Convergence
+
+> **Important**: All formats below use **software fake-quantize (STE)**, not hardware-native acceleration. See [Honest Comparison](#honest-comparison-axs-6-vs-hardware-fp8) for context.
 
 MiniGPT (4-layer Transformer, vocab=1000, dim=256), 200 steps, batch 8×64:
 
@@ -238,13 +243,12 @@ MiniGPT (4-layer Transformer, vocab=1000, dim=256), 200 steps, batch 8×64:
 | **AXS-6 (Triton)** | **6.31** | **11.70** | **1.27×** | **0.0537** | **1.06** | **Yes** |
 | NF4 | 4 | 18.57 | 2.01× | 6.8432 | 937 | No |
 | FP4 E2M1 | 4 | 24.74 | 2.68× | 6.8645 | 958 | No |
-| FP8 E4M3 | 8 | 30.01 | 3.26× | 7.1399 | 1261 | No |
+| FP8 E4M3 (naive) | 8 | 30.01 | 3.26× | 7.1399 | 1261 | No |
 
 Key observations:
-- AXS-6 is only **1.27× slower** than full-precision FP32 training
+- AXS-6 converges with simple STE — no delayed scaling or loss scaling needed
 - AXS-6 loss (0.0537) is within **0.7%** of FP32 loss (0.0533)
-- FP8, FP4, and NF4 all diverge to near random-guess loss (~ln(1000) ≈ 6.9)
-- AXS-6 is **faster** than all other quantised formats because its Triton kernel adds minimal overhead
+- Naive FP8/FP4/NF4 STE diverge — but this is an artifact of missing infrastructure, not a fundamental FP8 limitation
 
 ### Backend Comparison — Fake-Quantize Latency
 
@@ -308,7 +312,7 @@ tests/
 ## Running Tests
 
 ```bash
-# All tests (255 total)
+# All tests (323 total)
 pytest tests/ -v
 
 # Triton kernel tests (42)
@@ -357,14 +361,39 @@ Weights         Fake-Quantize   Matmul     Grad     Fake-Quantize  Grad
 
 4. **Sparsity** — ReLU and GeLU create sparsity, which AXS-6 handles efficiently (zero values use no dynamic range).
 
-### Why FP8/FP4 Fail Where AXS-6 Succeeds
+### Why FP8/FP4 Fail *With Naive STE* Where AXS-6 Succeeds
 
-AXS-6 achieves convergence where FP8 and FP4 don't because:
+> **Clarification**: FP8 *does* converge when using proper infrastructure (delayed scaling, mixed E4M3/E5M2, loss scaling) — as implemented in torchao and NVIDIA transformer-engine. The failures above are specifically with naive software STE (no scaling, no loss scaling).
+
+AXS-6 converges with simple STE where naive FP8 and FP4 don't because:
 
 1. **5 mantissa bits vs 3 (FP8) or 1 (FP4)** — 4× finer quantisation reduces gradient noise below the convergence threshold.
 2. **Shared exponent amortisation** — The block exponent captures per-block magnitude once, giving each value the full 5-bit mantissa for precision.
 3. **NormalFloat grid** — Non-uniform quantisation levels match the statistical distribution of neural network weights, minimising MSE.
 4. **Power-of-2 scaling** — Clean binary scaling avoids the rounding cascades that plague FP8's per-value exponent conversion.
+
+### Honest Comparison: AXS-6 vs Hardware FP8
+
+| | AXS-6 | Hardware FP8 (torchao) |
+|---|---|---|
+| **Matmul precision** | bf16/fp32 (fake-quantize only) | FP8 tensor cores (~2× throughput) |
+| **Mantissa bits** | 5 (better SNR) | 3 |
+| **Bits per value** | 6.31 (21% less) | 8.00 |
+| **Convergence with simple STE** | Yes | No (needs delayed scaling) |
+| **Hardware requirement** | Any CUDA GPU | H100/B200+ for native FP8 |
+| **Communication bandwidth** | 6.31 bits | 8 bits |
+| **Best use case** | Distributed training, non-H100 GPUs | Single-GPU throughput on H100+ |
+
+**Where AXS-6 genuinely wins**:
+- Quantisation quality (5-bit mantissa → better SNR → less degradation)
+- Communication bandwidth in distributed training (21% less)
+- Robustness (converges with minimal infrastructure)
+- Availability (works on any CUDA GPU, not just H100+)
+
+**Where hardware FP8 wins**:
+- Raw throughput (~2× via FP8 tensor cores)
+- VRAM (FP8 matmul uses less memory than AXS-6's bf16 matmul)
+- Ecosystem maturity (torchao, transformer-engine, DeepSpeed)
 
 ## Theoretical Foundation
 

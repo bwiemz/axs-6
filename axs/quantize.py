@@ -88,12 +88,27 @@ class ErrorFeedbackState:
         return list(self._buffers.keys())
 
 
-# Global default error feedback state
-_default_ef_state = ErrorFeedbackState()
+def _create_default_error_feedback_state() -> ErrorFeedbackState:
+    """Create a new ErrorFeedbackState. Deprecated: prefer explicit instances."""
+    import warnings
+    warnings.warn(
+        "The global default ErrorFeedbackState is deprecated. "
+        "Create an explicit instance: state = ErrorFeedbackState()",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+    return ErrorFeedbackState()
+
+
+# Lazy global — only created on first access via get_default_error_feedback_state()
+_default_ef_state: ErrorFeedbackState | None = None
 
 
 def get_default_error_feedback_state() -> ErrorFeedbackState:
-    """Return the module-level default error feedback state."""
+    """Return the module-level default error feedback state (deprecated)."""
+    global _default_ef_state
+    if _default_ef_state is None:
+        _default_ef_state = _create_default_error_feedback_state()
     return _default_ef_state
 
 
@@ -154,12 +169,23 @@ def quantize_with_error_feedback(
         rounding: Base rounding mode.
         param_name: Unique identifier for the error buffer.
         state: Error feedback state. Uses global default if None.
+            **Warning**: passing ``None`` is deprecated — create an explicit
+            ``ErrorFeedbackState()`` per model/training run to avoid shared
+            mutable state between unrelated models.
 
     Returns:
         Quantized tensor with error compensation applied.
     """
     if state is None:
-        state = _default_ef_state
+        import warnings
+        warnings.warn(
+            "quantize_with_error_feedback: passing state=None uses a shared "
+            "global ErrorFeedbackState. Create an explicit instance per model "
+            "to avoid cross-contamination.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        state = get_default_error_feedback_state()
 
     error_buf = state.get_buffer(param_name, tensor)
     corrected = tensor + error_buf

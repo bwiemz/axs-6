@@ -299,6 +299,16 @@ def convert_to_axs_unified(
     from axs.nn.modules import AXSLinear, AXSLayerNorm, AXSEmbedding
     from axs.v2.modules_v2 import AXSLinearV2, AXSLayerNormV2, AXSEmbeddingV2
 
+    # Known norm-layer types that should NOT be quantised.
+    # We handle nn.LayerNorm (converted to AXSLayerNormUnified) and
+    # explicitly skip RMSNorm variants (they don't need quantisation).
+    _NORM_TYPES: tuple[type, ...] = (nn.LayerNorm, AXSLayerNorm, AXSLayerNormV2)
+    try:
+        # PyTorch 2.4+ has nn.RMSNorm
+        _NORM_TYPES = _NORM_TYPES + (nn.RMSNorm,)  # type: ignore[attr-defined]
+    except AttributeError:
+        pass
+
     def _convert(module: nn.Module, prefix: str = "") -> None:
         for name, child in module.named_children():
             full_name = f"{prefix}.{name}" if prefix else name
@@ -342,6 +352,12 @@ def convert_to_axs_unified(
                 )
                 new_layer.weight.data.copy_(child.weight.data)
                 setattr(module, name, new_layer.to(device))
+
+            elif isinstance(child, _NORM_TYPES):
+                # Norm layers (including RMSNorm) are intentionally left
+                # unconverted — they don't need quantisation and the
+                # downstream linear layer quantises its input anyway.
+                continue
 
             else:
                 _convert(child, full_name)

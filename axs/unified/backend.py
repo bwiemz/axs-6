@@ -193,6 +193,7 @@ def _fused_fq_compilable(
     """
     original_shape = tensor.shape
     device = tensor.device
+    orig_dtype = tensor.dtype
     lut = _get_lut(device)
 
     flat = tensor.reshape(-1, tensor.shape[-1]).float()
@@ -228,7 +229,7 @@ def _fused_fq_compilable(
     if pad_amount > 0:
         result = result[:, :last_dim]
 
-    return result.reshape(original_shape)
+    return result.reshape(original_shape).to(orig_dtype)
 
 
 def _get_compiled_fq(stochastic: bool = False) -> callable:
@@ -250,6 +251,10 @@ def _get_compiled_fq(stochastic: bool = False) -> callable:
 # INT8 tensor core backend
 # ---------------------------------------------------------------------------
 
+# Cache for padded weight encodings to avoid re-encoding every call
+_INT8_WEIGHT_CACHE: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
 def _nf5_to_int8_row(
     tensor: torch.Tensor,
     block_size: int,
@@ -258,13 +263,17 @@ def _nf5_to_int8_row(
     """
     NF5 fake-quantize → per-row int8 encoding + scale.
 
+    Handles arbitrary batch dimensions by flattening to 2D.
+
     Returns:
         int8_tensor: ``[rows, cols]`` int8
         row_scale: ``[rows, 1]`` float32 (multiply to recover FP32)
     """
-    rows = tensor.shape[0]
-    last_dim = tensor.shape[-1]
-    flat = tensor.reshape(rows, -1).float()
+    orig_shape = tensor.shape
+    flat = tensor.reshape(-1, tensor.shape[-1]).float()
+    rows = flat.shape[0]
+    last_dim = flat.shape[-1]
+
     pad = (block_size - last_dim % block_size) % block_size
     if pad > 0:
         flat = F.pad(flat, (0, pad))
@@ -293,6 +302,18 @@ def _nf5_to_int8_row(
     return int8_vals, row_scale
 
 
+def _pad_to_multiple(tensor: torch.Tensor, dim: int, multiple: int) -> torch.Tensor:
+    """Pad tensor along `dim` to a multiple of `multiple`."""
+    size = tensor.shape[dim]
+    pad_amount = (multiple - size % multiple) % multiple
+    if pad_amount == 0:
+        return tensor
+    pad_spec = [0] * (2 * tensor.ndim)
+    # F.pad uses reversed dimension order
+    pad_spec[2 * (tensor.ndim - 1 - dim) + 1] = pad_amount
+    return F.pad(tensor, pad_spec)
+
+
 def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -305,31 +326,39 @@ def int8_linear(
     Applies NF5 fake-quantization then performs the matmul via
     ``torch._int_mm`` with per-row scale correction.
 
-    Best for large matrices where the INT8 GEMM speedup offsets
-    the encoding overhead.
+    Handles arbitrary batch dimensions (not just 2D). Caches weight
+    encoding by data_ptr to avoid redundant re-encoding.
 
     Args:
-        x: Input ``[batch, in_features]``.
-        weight: Weight ``[out_features, in_features]``.
+        x: Input ``(*, in_features)``.
+        weight: Weight ``(out_features, in_features)``.
         bias: Optional bias.
         block_size: AXS-6 block size.
 
     Returns:
-        Output ``[batch, out_features]``.
+        Output ``(*, out_features)``.
     """
     device = x.device
     lut = _get_lut(device)
 
-    # Flatten to 2D
+    # Flatten to 2D for int_mm
     orig_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1])
     M = x_2d.shape[0]
 
-    # Encode to int8
+    # Encode input to int8
     x_i8, x_s = _nf5_to_int8_row(x_2d, block_size, lut)
-    w_i8, w_s = _nf5_to_int8_row(weight, block_size, lut)
 
-    # Pad M to multiple of 32 (torch._int_mm requirement)
+    # Cache weight encoding (weights don't change within a step)
+    w_key = weight.data_ptr()
+    cached = _INT8_WEIGHT_CACHE.get(w_key)
+    if cached is not None and cached[0].shape == (weight.shape[0], weight.shape[1]):
+        w_i8, w_s = cached
+    else:
+        w_i8, w_s = _nf5_to_int8_row(weight, block_size, lut)
+        _INT8_WEIGHT_CACHE[w_key] = (w_i8, w_s)
+
+    # Pad M to multiple of 32 (torch._int_mm requirement on some GPUs)
     M_pad = (32 - M % 32) % 32
     if M_pad > 0:
         x_i8 = F.pad(x_i8, (0, 0, 0, M_pad))
@@ -499,3 +528,8 @@ def backend_info() -> dict[str, object]:
         ),
         "lut_cached_devices": list(str(d) for d in _LUT_CACHE),
     }
+
+
+def clear_int8_weight_cache() -> None:
+    """Clear the INT8 weight encoding cache (call after optimizer.step())."""
+    _INT8_WEIGHT_CACHE.clear()
