@@ -50,6 +50,12 @@ from axs.unified.training_unified import (
     AmaxEMA,
     AXSTrainingPipelineUnified,
 )
+from axs.unified.mixed_precision import (
+    AXSLinearMixedPrecision,
+    axs_linear_mixed_precision,
+    convert_to_axs_mixed_precision,
+    estimate_memory_savings,
+)
 from axs.unified.triton_kernels import (
     has_triton,
     triton_fused_fake_quantize,
@@ -89,4 +95,9 @@ __all__ = [
     "has_triton",
     "triton_fused_fake_quantize",
     "triton_fused_linear",
+    # Mixed-precision
+    "AXSLinearMixedPrecision",
+    "axs_linear_mixed_precision",
+    "convert_to_axs_mixed_precision",
+    "estimate_memory_savings",
 ]

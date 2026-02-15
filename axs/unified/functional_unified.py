@@ -95,6 +95,9 @@ class _AXSLinearUnifiedFunction(torch.autograd.Function):
       - Standard ``F.linear``
 
     Backward:
+      - Recompute ``weight_q`` from the saved leaf weight (avoids storing
+        the quantised weight in activation memory — the Triton FQ kernel
+        makes recomputation essentially free at ~0.02 ms).
       - Optionally fake-quantise ``grad_output`` (stochastic)
       - Standard linear backward through quantised inputs/weights
     """
@@ -118,7 +121,9 @@ class _AXSLinearUnifiedFunction(torch.autograd.Function):
 
         output = F.linear(input_q, weight_q, bias)
 
-        ctx.save_for_backward(input_q, weight_q, bias)
+        # Save weight (leaf — only a reference, not a copy) instead of
+        # weight_q (computed tensor — would consume activation memory).
+        ctx.save_for_backward(input_q, weight, bias)
         ctx.block_size = block_size  # type: ignore[attr-defined]
         ctx.quantize_grad = quantize_grad  # type: ignore[attr-defined]
 
@@ -132,9 +137,14 @@ class _AXSLinearUnifiedFunction(torch.autograd.Function):
         torch.Tensor | None, torch.Tensor | None, torch.Tensor | None,
         None, None, None,
     ]:
-        input_q, weight_q, bias = ctx.saved_tensors  # type: ignore[attr-defined]
+        input_q, weight, bias = ctx.saved_tensors  # type: ignore[attr-defined]
         block_size: int = ctx.block_size  # type: ignore[attr-defined]
         quantize_grad: bool = ctx.quantize_grad  # type: ignore[attr-defined]
+
+        # Recompute weight_q from the leaf parameter (essentially free
+        # thanks to the Triton FQ kernel, saves ~weight_size bytes of
+        # activation memory per layer).
+        weight_q = _accel_fq(weight, block_size, "nearest")
 
         if quantize_grad:
             grad_output = _accel_fq(grad_output, block_size, "stochastic")

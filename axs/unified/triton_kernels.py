@@ -304,6 +304,10 @@ def triton_fused_fake_quantize(
     Drop-in replacement for :func:`quantize_unified.fused_fake_quantize`
     with identical numerics (bit-exact for ``rounding='nearest'``).
 
+    Supports FP32, BF16, and FP16 inputs.  The NF5 computation is always
+    performed in FP32 internally; the output is cast back to the input
+    dtype.
+
     Args:
         tensor: Input tensor of any shape on a CUDA device.
         block_size: Quantisation block size (8, 16, or 32).
@@ -311,7 +315,8 @@ def triton_fused_fake_quantize(
         n_blocks: Number of blocks processed per Triton program (tuning knob).
 
     Returns:
-        Float32 tensor of the same shape with AXS-6 NF5 quantisation noise.
+        Tensor of the same shape **and dtype** with AXS-6 NF5 quantisation
+        noise.
 
     Raises:
         RuntimeError: If Triton is not available or tensor is not on CUDA.
@@ -325,10 +330,12 @@ def triton_fused_fake_quantize(
     )
 
     orig_shape = tensor.shape
+    orig_dtype = tensor.dtype
     device = tensor.device
     lut = _get_lut(device)
 
     # Reshape to (-1, last_dim), pad last dim — matches fused_fake_quantize
+    # Always compute in FP32 (LUT is FP32); cast back at the end.
     flat = tensor.reshape(-1, tensor.shape[-1]).float()
     last_dim = flat.shape[-1]
     pad = (block_size - last_dim % block_size) % block_size
@@ -355,11 +362,12 @@ def triton_fused_fake_quantize(
         STOCHASTIC=stochastic,
     )
 
-    # Un-pad and restore original shape
+    # Un-pad and restore original shape and dtype
     out = out.reshape(flat.shape)
     if pad > 0:
         out = out[:, :last_dim]
-    return out.reshape(orig_shape)
+    result = out.reshape(orig_shape)
+    return result if orig_dtype == torch.float32 else result.to(orig_dtype)
 
 
 # ── Fused linear defaults ──────────────────────────────────────────────────
@@ -419,8 +427,9 @@ def triton_fused_linear(
             "Use the separate FQ + F.linear path for other block sizes."
         )
 
-    # Flatten input to 2-D
+    # Flatten input to 2-D (always compute in FP32; cast output back)
     orig_shape = input.shape
+    orig_dtype = input.dtype
     x_2d = input.reshape(-1, input.shape[-1]).contiguous().float()
     M, K = x_2d.shape
     N = weight.shape[0]
@@ -467,6 +476,7 @@ def triton_fused_linear(
         USE_TF32=torch.backends.cuda.matmul.allow_tf32,
     )
 
-    # Restore original batch dimensions
+    # Restore original batch dimensions and dtype
     out_shape = orig_shape[:-1] + (N,)
-    return out.reshape(out_shape)
+    result = out.reshape(out_shape)
+    return result if orig_dtype == torch.float32 else result.to(orig_dtype)
