@@ -279,6 +279,30 @@ MiniGPT, 50 training steps:
 | SNR | 31.2 dB |
 | MSE reduction vs uniform grid | **34%** |
 
+### Real-World Pretraining: CodeForge 150M (RTX 5070 Ti)
+
+Independent benchmark by a separate reviewer against a real pretraining workload
+(CodeForge 150M parameter code-generation model, batch=4, seq=512):
+
+| Config | ms/step | vs BF16 | Peak VRAM |
+|--------|---------|---------|-----------|
+| BF16 Baseline | 69.6 | 1.00× | 2,359 MB |
+| **AXS-6 Mixed Precision (BF16+NF5)** | **234.9** | **3.38×** | **3,459 MB** |
+| AXS-6 Unified (Triton) | 373.6 | 5.37× | 4,846 MB |
+| torchao FP8 (hardware) | 412.8 | 5.93× | 3,115 MB |
+
+Key observations:
+
+1. **AXS-6 is faster than FP8.** The mixed-precision path (BF16+NF5) is 1.76× faster than torchao FP8, and even the FP32 unified Triton path is ~10% faster.
+
+2. **Plain BF16 is still king at 150M scale.** All quantized paths add 3.4–5.9× overhead at this model size because the quantize/dequantize cost dominates — the model fits comfortably in VRAM and compute is not memory-bandwidth-bound.
+
+3. **VRAM: FP8 is more memory-efficient than AXS-6 Unified** (3,115 MB vs 4,846 MB), but AXS-6 Mixed Precision (3,459 MB) is close — the BF16 activations + weight recomputation strategy narrows the gap.
+
+4. **Loss convergence is equivalent** across all methods over the test run. No divergence or instability observed.
+
+> **Bottom line**: At 150M parameters, use plain BF16. AXS-6 becomes interesting at 1B+ where memory bandwidth is the bottleneck and 6-bit gradient compression (21% less than FP8) enables meaningful communication savings in distributed training.
+
 ## Project Structure
 
 ```
@@ -303,7 +327,7 @@ benchmarks/
 
 tests/
 ├── test_triton_kernels.py     # 42 Triton kernel tests
-├── test_backend.py            # 55 backend tests
+├── test_backend.py            # 81 backend tests
 ├── test_unified.py            # 66 unified implementation tests
 ├── test_core.py               # V1 format tests (55)
 └── test_v2.py                 # V2 tests (37)
@@ -312,13 +336,13 @@ tests/
 ## Running Tests
 
 ```bash
-# All tests (323 total)
+# All tests (349 total)
 pytest tests/ -v
 
 # Triton kernel tests (42)
 pytest tests/test_triton_kernels.py -v
 
-# Unified + backend (121 tests)
+# Unified + backend (147 tests)
 pytest tests/test_unified.py tests/test_backend.py -v
 ```
 
