@@ -303,11 +303,11 @@ Key observations:
 
 > **Bottom line**: At 150M parameters, use plain BF16. AXS-6 becomes interesting at 1B+ where memory bandwidth is the bottleneck and 6-bit gradient compression (21% less than FP8) enables meaningful communication savings in distributed training.
 
-### "Free Speed" Theory Test: AXS-6 vs BF16 cuBLAS (RTX 5070 Ti)
+### Bandwidth vs Compute: AXS-6 vs BF16 cuBLAS (RTX 5070 Ti)
 
-A [Gemini analysis](https://gemini.google.com/share/cdf67d841380) proposed that AXS-6 could achieve "free speed" on consumer GPUs: the 25% bandwidth savings (6.31-bit vs 8-bit) might outweigh dequantization overhead on memory-bound workloads, since the GPU cores are idle waiting for data anyway.
+AXS-6 compresses data to 6.31 bits — 25% less than FP8 and 60% less than BF16. In theory, the bandwidth savings could outweigh dequantization overhead on memory-bound workloads, since the GPU cores are idle waiting for data anyway.
 
-We tested this hypothesis with `triton.testing.do_bench` across LLM-scale matrix shapes. The AXS-6 fused matmul kernel quantizes both A and B tiles in-kernel, while BF16 uses hardware-accelerated cuBLAS.
+We tested this with `triton.testing.do_bench` across LLM-scale matrix shapes. The AXS-6 fused matmul kernel quantizes both A and B tiles in-kernel, while BF16 uses hardware-accelerated cuBLAS.
 
 **Test 1: Matmul Throughput**
 
@@ -338,18 +338,18 @@ We tested this hypothesis with `triton.testing.do_bench` across LLM-scale matrix
 | (2048, 4096, 4096) | 5.05 | 16.35 | 0.31× |
 | (2048, 4096, 11008) | 13.29 | 56.99 | 0.23× |
 
-**Verdict: Free Speed theory NOT confirmed on RTX 5070 Ti.**
+**Verdict: BF16 cuBLAS wins on raw throughput.**
 
 The RTX 5070 Ti's Blackwell tensor cores and high memory bandwidth (~504 GB/s) mean that BF16 cuBLAS is never memory-bound at these shapes — the hardware is too fast for software dequantization to be "free." AXS-6 is consistently 3–14× slower on raw matmul throughput.
 
-**Why this doesn't invalidate AXS-6:**
+**Where AXS-6 earns its place:**
 
-1. **Training convergence is the real win.** AXS-6 converges with simple STE where naive FP8/FP4 diverge (see table above). For researchers who don't have the infrastructure for delayed scaling, this is worth the throughput cost.
-2. **VRAM capacity at scale.** The matmul benchmark measures a single layer — the win comes from storing an entire 7B model's weights in 6.31 bits vs 16 bits, which is the difference between "it fits on your 24GB card" and "it doesn't."
+1. **Training convergence without infrastructure.** AXS-6 converges with simple STE where naive FP8/FP4 diverge (see table above). No delayed scaling, no amax history, no loss scaling — just standard AdamW. For researchers without the tooling for FP8 convergence tricks, this matters more than throughput.
+2. **VRAM capacity at scale.** The matmul benchmark measures a single layer — the real win is storing an entire model's weights in 6.31 bits vs 16 bits. A 7B model in AXS-6 uses ~5.5 GB vs ~14 GB in BF16 — the difference between training on a single 24GB card and needing two.
 3. **Communication bandwidth.** In distributed training, AXS-6 gradients are 21% smaller than FP8 and 60% smaller than BF16, which matters when inter-GPU communication is the bottleneck.
-4. **Older/bandwidth-limited GPUs.** The "free speed" theory may hold on GPUs with lower compute-to-bandwidth ratios (e.g., RTX 3090/A100 where memory bandwidth is more often the bottleneck).
+4. **Bandwidth-limited hardware.** On GPUs with lower compute-to-bandwidth ratios (e.g., RTX 3090, A100), the bandwidth savings may offset more of the dequantization cost.
 
-> **Honest takeaway**: AXS-6 is not a faster-matmul format — it's a *fits-in-memory* and *converges-reliably* format. On modern consumer GPUs, the Triton dequantization overhead is real. The value proposition is VRAM savings, training stability, and communication compression, not raw compute speed.
+> **Honest takeaway**: AXS-6 is not a faster-matmul format — it's a *fits-in-memory* and *converges-reliably* format. The Triton dequantization overhead is real on modern GPUs. The value proposition is VRAM savings, training stability, and communication compression, not raw compute speed.
 
 ## Project Structure
 
