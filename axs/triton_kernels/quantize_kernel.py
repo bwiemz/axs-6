@@ -94,7 +94,7 @@ if TRITON_AVAILABLE:
             rand = tl.rand(batch_id * num_blocks + block_id, offsets)
             magnitudes = tl.where(rand < frac, floor_vals + 1.0, floor_vals)
         else:
-            magnitudes = tl.math.nearbyint(scaled)
+            magnitudes = tl.math.floor(scaled + 0.5)
 
         # Clamp to [0, MAX_MAGNITUDE]
         magnitudes = tl.minimum(tl.maximum(magnitudes, 0.0), MAX_MAGNITUDE * 1.0)
@@ -203,7 +203,7 @@ if TRITON_AVAILABLE:
             rand = tl.rand(batch_id * num_blocks + block_id, offsets)
             magnitudes = tl.where(rand < frac, floor_vals + 1.0, floor_vals)
         else:
-            magnitudes = tl.math.nearbyint(scaled)
+            magnitudes = tl.math.floor(scaled + 0.5)
 
         magnitudes = tl.minimum(tl.maximum(magnitudes, 0.0), MAX_MAGNITUDE * 1.0)
 

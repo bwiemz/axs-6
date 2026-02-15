@@ -303,6 +303,54 @@ Key observations:
 
 > **Bottom line**: At 150M parameters, use plain BF16. AXS-6 becomes interesting at 1B+ where memory bandwidth is the bottleneck and 6-bit gradient compression (21% less than FP8) enables meaningful communication savings in distributed training.
 
+### "Free Speed" Theory Test: AXS-6 vs BF16 cuBLAS (RTX 5070 Ti)
+
+A [Gemini analysis](https://gemini.google.com/share/cdf67d841380) proposed that AXS-6 could achieve "free speed" on consumer GPUs: the 25% bandwidth savings (6.31-bit vs 8-bit) might outweigh dequantization overhead on memory-bound workloads, since the GPU cores are idle waiting for data anyway.
+
+We tested this hypothesis with `triton.testing.do_bench` across LLM-scale matrix shapes. The AXS-6 fused matmul kernel quantizes both A and B tiles in-kernel, while BF16 uses hardware-accelerated cuBLAS.
+
+**Test 1: Matmul Throughput**
+
+| Shape (M, N, K) | Workload | BF16 (ms) | AXS-6 (ms) | Speedup | Zone |
+|------------------|----------|-----------|-------------|---------|------|
+| (1, 4096, 4096) | Single token decode | 0.088 | 0.356 | 0.25× | Compute Bound |
+| (32, 4096, 4096) | Small batch inference | 0.120 | 0.435 | 0.28× | Compute Bound |
+| (128, 4096, 4096) | Medium batch inference | 0.083 | 0.650 | 0.13× | Compute Bound |
+| (512, 4096, 4096) | Moderate batch training | 0.449 | 2.141 | 0.21× | Compute Bound |
+| (2048, 4096, 4096) | Training / prefill | 1.547 | 7.703 | 0.20× | Compute Bound |
+| (4096, 11008, 4096) | Llama MLP layer | 8.101 | 46.699 | 0.17× | Compute Bound |
+
+**Test 2: Fake-Quantize Overhead**
+
+| Size | Clone (ms) | AXS-6 FQ (ms) | Overhead | AXS-6 BW (GB/s) | Clone BW (GB/s) |
+|------|------------|----------------|----------|------------------|-----------------|
+| 1024×1024 | 0.027 | 0.034 | 1.26× | 247 | 311 |
+| 4096×4096 | 0.181 | 0.476 | 2.63× | 282 | 743 |
+| 8192×4096 | 0.373 | 0.923 | 2.47× | 291 | 720 |
+| 4096×11008 | 0.489 | 1.226 | 2.50× | 294 | 737 |
+
+**Test 3: End-to-End Linear Layer (Forward + Backward)**
+
+| Shape (batch, in, out) | BF16 (ms) | AXS-6 (ms) | Speedup |
+|------------------------|-----------|-------------|---------|
+| (128, 4096, 4096) | 0.66 | 9.46 | 0.07× |
+| (512, 4096, 4096) | 1.59 | 12.11 | 0.13× |
+| (2048, 4096, 4096) | 5.05 | 16.35 | 0.31× |
+| (2048, 4096, 11008) | 13.29 | 56.99 | 0.23× |
+
+**Verdict: Free Speed theory NOT confirmed on RTX 5070 Ti.**
+
+The RTX 5070 Ti's Blackwell tensor cores and high memory bandwidth (~504 GB/s) mean that BF16 cuBLAS is never memory-bound at these shapes — the hardware is too fast for software dequantization to be "free." AXS-6 is consistently 3–14× slower on raw matmul throughput.
+
+**Why this doesn't invalidate AXS-6:**
+
+1. **Training convergence is the real win.** AXS-6 converges with simple STE where naive FP8/FP4 diverge (see table above). For researchers who don't have the infrastructure for delayed scaling, this is worth the throughput cost.
+2. **VRAM capacity at scale.** The matmul benchmark measures a single layer — the win comes from storing an entire 7B model's weights in 6.31 bits vs 16 bits, which is the difference between "it fits on your 24GB card" and "it doesn't."
+3. **Communication bandwidth.** In distributed training, AXS-6 gradients are 21% smaller than FP8 and 60% smaller than BF16, which matters when inter-GPU communication is the bottleneck.
+4. **Older/bandwidth-limited GPUs.** The "free speed" theory may hold on GPUs with lower compute-to-bandwidth ratios (e.g., RTX 3090/A100 where memory bandwidth is more often the bottleneck).
+
+> **Honest takeaway**: AXS-6 is not a faster-matmul format — it's a *fits-in-memory* and *converges-reliably* format. On modern consumer GPUs, the Triton dequantization overhead is real. The value proposition is VRAM savings, training stability, and communication compression, not raw compute speed.
+
 ## Project Structure
 
 ```
@@ -323,7 +371,8 @@ benchmarks/
 ├── benchmark_triton.py            # Triton vs compiled vs eager
 ├── benchmark_axs6_vs_fp8_fp4.py   # AXS-6 vs FP32/FP8/FP4/NF4
 ├── benchmark_unified.py           # Speed + quality + training
-└── benchmark_backend.py           # Backend acceleration
+├── benchmark_backend.py           # Backend acceleration
+└── benchmark_free_speed.py        # "Free Speed" theory test (matmul, bandwidth, VRAM)
 
 tests/
 ├── test_triton_kernels.py     # 42 Triton kernel tests
@@ -357,6 +406,9 @@ python -m benchmarks.benchmark_axs6_vs_fp8_fp4
 
 # Full benchmark (latency + quality + training)
 python -m benchmarks.benchmark_unified
+
+# "Free Speed" theory test (AXS-6 vs BF16 cuBLAS throughput)
+python -m benchmarks.benchmark_free_speed
 ```
 
 ## How It Works

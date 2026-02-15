@@ -100,7 +100,7 @@ if TRITON_AVAILABLE:
                 a_exp = tl.math.floor(tl.math.log2(a_safe)) + 1.0
                 a_scale = tl.math.exp2(a_exp)
                 a_norm = a_abs / tl.where(a_scale > 0, a_scale, 1e-45)
-                a_mag = tl.math.nearbyint(a_norm * MAX_MAGNITUDE)
+                a_mag = tl.math.floor(a_norm * MAX_MAGNITUDE + 0.5)
                 a_mag = tl.minimum(tl.maximum(a_mag, 0.0), MAX_MAGNITUDE * 1.0)
                 a_q = (a_mag / MAX_MAGNITUDE) * a_scale
                 a_q = tl.where(a < 0, -a_q, a_q)
@@ -116,7 +116,7 @@ if TRITON_AVAILABLE:
                 b_exp = tl.math.floor(tl.math.log2(b_safe)) + 1.0
                 b_scale = tl.math.exp2(b_exp)
                 b_norm = b_abs / tl.where(b_scale > 0, b_scale, 1e-45)
-                b_mag = tl.math.nearbyint(b_norm * MAX_MAGNITUDE)
+                b_mag = tl.math.floor(b_norm * MAX_MAGNITUDE + 0.5)
                 b_mag = tl.minimum(tl.maximum(b_mag, 0.0), MAX_MAGNITUDE * 1.0)
                 b_q = (b_mag / MAX_MAGNITUDE) * b_scale
                 b_q = tl.where(b < 0, -b_q, b_q)
